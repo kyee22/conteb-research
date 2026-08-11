@@ -1,0 +1,35 @@
+{
+    "model_path": "Qwen/Qwen3-Embedding-8B",
+    "model_name": "Qwen3-Embedding-8B-esg",
+    "model_type": "qwen3",
+    "date": "2026-08-11 08:56:21",
+    "extended_context": false,
+    "use_prefix": false,
+    "colbert_model": false,
+    "metrics": {
+        "esg-reports": {
+            "ndcg_at_1": 0.36111,
+            "ndcg_at_5": 0.42129,
+            "ndcg_at_10": 0.47916,
+            "ndcg_at_50": 0.52421,
+            "ndcg_at_100": 0.53749,
+            "map_at_1": 0.26944,
+            "map_at_5": 0.36625,
+            "map_at_10": 0.39455,
+            "map_at_50": 0.40722,
+            "map_at_100": 0.40918,
+            "recall_at_1": 0.26944,
+            "recall_at_5": 0.50139,
+            "recall_at_10": 0.66111,
+            "recall_at_50": 0.8213,
+            "recall_at_100": 0.88333,
+            "precision_at_1": 0.36111,
+            "precision_at_5": 0.15556,
+            "precision_at_10": 0.10278,
+            "precision_at_50": 0.02889,
+            "precision_at_100": 0.01611,
+            "ndcg_at_10_maxsim": 0.94586,
+            "runtime": 91.78087449073792
+        }
+    }
+}

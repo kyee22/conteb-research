@@ -1,0 +1,35 @@
+{
+    "model_path": "SituatedEmbedding/SitEmb-v1.5-Qwen3-chunk-only",
+    "model_name": "SitEmb-v1.5-Qwen3-chunk-only-esg",
+    "model_type": "sit_chunk_only",
+    "date": "2026-08-11 08:59:46",
+    "extended_context": false,
+    "use_prefix": false,
+    "colbert_model": false,
+    "metrics": {
+        "esg-reports": {
+            "ndcg_at_1": 0.41667,
+            "ndcg_at_5": 0.49367,
+            "ndcg_at_10": 0.53488,
+            "ndcg_at_50": 0.57769,
+            "ndcg_at_100": 0.59552,
+            "map_at_1": 0.33426,
+            "map_at_5": 0.44406,
+            "map_at_10": 0.4659,
+            "map_at_50": 0.47964,
+            "map_at_100": 0.48184,
+            "recall_at_1": 0.33426,
+            "recall_at_5": 0.54074,
+            "recall_at_10": 0.64352,
+            "recall_at_50": 0.7912,
+            "recall_at_100": 0.88704,
+            "precision_at_1": 0.41667,
+            "precision_at_5": 0.17222,
+            "precision_at_10": 0.10833,
+            "precision_at_50": 0.02889,
+            "precision_at_100": 0.01611,
+            "ndcg_at_10_maxsim": 0.89281,
+            "runtime": 120.80633449554443
+        }
+    }
+}

@@ -1,0 +1,35 @@
+{
+    "model_path": "/root/kyx/contextual-embeddings/checkpoints/test/modernbert-test_20260717084848",
+    "model_name": "esg",
+    "model_type": "contextual",
+    "date": "2026-08-06 06:45:09",
+    "extended_context": false,
+    "use_prefix": false,
+    "colbert_model": false,
+    "metrics": {
+        "esg-reports": {
+            "ndcg_at_1": 0.19444,
+            "ndcg_at_5": 0.25285,
+            "ndcg_at_10": 0.29668,
+            "ndcg_at_50": 0.36574,
+            "ndcg_at_100": 0.38094,
+            "map_at_1": 0.1213,
+            "map_at_5": 0.20694,
+            "map_at_10": 0.22549,
+            "map_at_50": 0.24136,
+            "map_at_100": 0.24344,
+            "recall_at_1": 0.1213,
+            "recall_at_5": 0.32685,
+            "recall_at_10": 0.44722,
+            "recall_at_50": 0.7213,
+            "recall_at_100": 0.78565,
+            "precision_at_1": 0.19444,
+            "precision_at_5": 0.09444,
+            "precision_at_10": 0.06667,
+            "precision_at_50": 0.02278,
+            "precision_at_100": 0.01361,
+            "ndcg_at_10_maxsim": 0.67042,
+            "runtime": 25.36150097846985
+        }
+    }
+}
