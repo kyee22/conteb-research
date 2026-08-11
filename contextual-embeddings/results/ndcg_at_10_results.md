@@ -22,6 +22,7 @@
 | metrics_no_prefix_pplx-embed-v1-0.6B_sentence_transformer.json | 0.73685 | 0.6736 | 0.74141 | 0.48926 |  | 0.13117 | 0.54148 | 0.10969 |
 | metrics_no_prefix_Qwen3-Embedding-8B-esg_qwen3.json |  |  |  |  | 0.47916 |  |  |  |
 | metrics_no_prefix_Qwen3-Embedding-8B_qwen3.json | 0.78291 | 0.74939 | 0.79751 | 0.61939 |  | 0.35299 | 0.72436 | 0.13521 |
+| metrics_no_prefix_SitEmb-v1.5-note_sit_contextual.json | 0.80637 | 0.82356 | 0.82119 | 0.57941 |  | 0.64903 | 0.88501 | 0.78005 |
 | metrics_no_prefix_SitEmb-v1.5-Qwen3-chunk-only-esg_sit_chunk_only.json |  |  |  |  | 0.53488 |  |  |  |
 | metrics_no_prefix_SitEmb-v1.5-Qwen3-chunk-only_sit_chunk_only.json | 0.75449 | 0.7837 | 0.81422 | 0.59491 |  | 0.26741 | 0.78961 | 0.22781 |
 | metrics_no_prefix_SitEmb-v1.5-Qwen3_sit_contextual.json | 0.82035 | 0.82207 | 0.82634 | 0.57078 |  | 0.64714 | 0.87324 | 0.87536 |
