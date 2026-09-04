@@ -63,6 +63,8 @@ lightning_logs/
 runs/
 outputs/
 results/
+!conteb/results/
+!conteb/results/**
 !contextual-embeddings/results/
 !contextual-embeddings/results/**
 artifacts/

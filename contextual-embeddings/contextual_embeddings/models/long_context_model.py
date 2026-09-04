@@ -505,6 +505,52 @@ class LongContextEmbeddingModel(SentenceTransformer):
         input_ids[torch.arange(input_ids.shape[0]), seq_ends] = self.join_token_id
         return input_ids
 
+    def _encode_query_inputs(self, query_inputs: dict[str, Tensor]) -> Tensor:
+        """Encode queries in smaller forwards while preserving a single loss batch.
+
+        The collator flattens every query belonging to every document in the
+        device batch. Splitting that tensor here reduces the encoder's peak
+        activation memory without changing the set of in-sequence or in-batch
+        negatives used by the loss.
+        """
+        output_key = "sentence_embedding" if self.pooling_mode == "average" else "token_embeddings"
+        reference = query_inputs.get("input_ids", query_inputs.get("attention_mask"))
+        if reference is None:
+            raise ValueError("query_inputs must contain input_ids or attention_mask")
+
+        n_queries = reference.shape[0]
+        micro_batch_size = self.query_micro_batch_size
+        if micro_batch_size is None or micro_batch_size >= n_queries:
+            return self.base_model(query_inputs)[output_key]
+
+        embeddings = []
+        original_seq_len = query_inputs.get("attention_mask", reference).shape[1]
+        for start in range(0, n_queries, micro_batch_size):
+            end = min(start + micro_batch_size, n_queries)
+            micro_inputs = {
+                key: value[start:end]
+                if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == n_queries
+                else value
+                for key, value in query_inputs.items()
+            }
+
+            # Average pooling does not need a common sequence dimension across
+            # microbatches, so discard padding introduced by longer queries in
+            # other microbatches. Token pooling keeps the original width to
+            # preserve the existing MaxSim behavior exactly.
+            if self.pooling_mode == "average" and "attention_mask" in micro_inputs:
+                micro_seq_len = max(1, int(micro_inputs["attention_mask"].sum(dim=1).max().item()))
+                micro_inputs = {
+                    key: value[:, :micro_seq_len]
+                    if isinstance(value, Tensor) and value.ndim >= 2 and value.shape[1] == original_seq_len
+                    else value
+                    for key, value in micro_inputs.items()
+                }
+
+            embeddings.append(self.base_model(micro_inputs)[output_key])
+
+        return torch.cat(embeddings, dim=0)
+
     def forward(self, *args, **kwargs):
         """
         Forward pass of the model. Computes the loss for the given batch of queries and documents.
@@ -521,7 +567,11 @@ class LongContextEmbeddingModel(SentenceTransformer):
                 - "add_prefixes": Whether to add prefixes to the document inputs (default: False).
         """
         query_inputs = args[0]["query_inputs"]
-        query_model_outputs = self.base_model(query_inputs)
+        # ⚠️ may encounter spike in memory usage at middle of training
+        # query_model_outputs = self.base_model(query_inputs)
+
+        # 😊 so we split the queries into smaller micro-batches
+        query_embeddings = self._encode_query_inputs(query_inputs)
 
         doc_inputs = args[0]["docs_inputs"]
         doc_token_embeddings = self.base_model(doc_inputs)["token_embeddings"]
@@ -542,11 +592,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
             doc_token_embeddings,
         )
 
-        if self.pooling_mode == "average":
-            query_embeddings = query_model_outputs["sentence_embedding"]  # (n_queries_in_batch, dim)
-        elif self.pooling_mode == "tokens":
-            query_embeddings = query_model_outputs["token_embeddings"]  # (n_queries_in_batch, max_query_len, dim)
-        else:
+        if self.pooling_mode not in {"average", "tokens"}:
             raise ValueError(f"Pooling mode {self.pooling_mode} not supported. Use 'average' or 'tokens'.")
 
         if "loss_type" not in kwargs or kwargs["loss_type"] == "weighted":
@@ -816,6 +862,9 @@ class LongContextEmbeddingModel(SentenceTransformer):
             list[list[torch.Tensor]]: A list of lists of embeddings, where each inner list corresponds to a document,
             and contains the embeddings of the chunks in that document."""
 
+        return self.embed_documents_right(documents, batch_size)
+
+
         # For max{document} <= max_seq_length
         all_outputs = []
         for i in tqdm(range(0, len(documents), batch_size), "Embedding documents", disable=not self.show_progress_bar):
@@ -827,6 +876,95 @@ class LongContextEmbeddingModel(SentenceTransformer):
         # ]
 
         return all_outputs
+
+    def _embed_documents_directional(self, documents, batch_size, direction):
+        """Embed chunks using a prefix-only or suffix-only context window.
+
+        Each target chunk is encoded in its own context window, so the returned
+        embedding for chunk ``i`` is pooled from the same chunk position as in
+        :meth:`embed_documents`, while the model can only attend to the selected
+        side of the document.  The actual encoding is delegated to
+        :meth:`embed_batch_documents` to keep tokenization, pooling, truncation,
+        prefixes, and normalization identical to the regular late-chunking path.
+        """
+        if direction not in {"left", "right"}:
+            raise ValueError("direction must be either 'left' or 'right'")
+
+        all_outputs = []
+        for start in tqdm(
+            range(0, len(documents), batch_size),
+            f"Embedding documents ({direction} context)",
+            disable=not self.show_progress_bar,
+        ):
+            document_batch = documents[start : start + batch_size]
+            context_windows = []
+            target_positions = []
+            document_indices = []
+
+            for document_index, doc in enumerate(document_batch):
+                for chunk_index in range(len(doc)):
+                    if direction == "left":
+                        context_windows.append(doc[: chunk_index + 1])
+                        target_positions.append(chunk_index)
+                    else:
+                        context_windows.append(doc[chunk_index:])
+                        target_positions.append(0)
+                    document_indices.append(document_index)
+
+            window_embeddings = self.embed_batch_documents(context_windows)
+            batch_outputs = [[] for _ in document_batch]
+            for embeddings, document_index, target_position in zip(
+                window_embeddings, document_indices, target_positions
+            ):
+                batch_outputs[document_index].append(embeddings[target_position])
+
+            all_outputs.extend(batch_outputs)
+
+        return all_outputs
+
+    def embed_documents_left(self, documents, batch_size=64):
+        """Embed chunks with only their preceding context visible.
+
+        For a document ``[C1, ..., Ci, ..., Cn]``, chunk ``Ci`` is encoded in
+        the prefix window ``[C1, ..., Ci]`` and its embedding is extracted from
+        that window.  Thus ``Ci`` can attend to itself and all chunks before it,
+        but no chunks after it.  This is an analysis/control variant of late
+        chunking, useful for measuring the contribution of left context; it is
+        not intended as a separate training method.
+
+        Args:
+            documents (list[list[str]]): Documents represented as ordered lists
+                of text chunks.
+            batch_size (int): Number of input documents processed per batch.
+
+        Returns:
+            list[list[torch.Tensor]]: One embedding per input chunk, in the same
+            document and chunk order as ``documents``.  Embedding shape and
+            normalization follow :meth:`embed_documents`.
+        """
+        return self._embed_documents_directional(documents, batch_size, "left")
+
+    def embed_documents_right(self, documents, batch_size=64):
+        """Embed chunks with only their following context visible.
+
+        For a document ``[C1, ..., Ci, ..., Cn]``, chunk ``Ci`` is encoded in
+        the suffix window ``[Ci, ..., Cn]`` and its embedding is extracted from
+        that window.  Thus ``Ci`` can attend to itself and all chunks after it,
+        but no chunks before it.  This is an analysis/control variant of late
+        chunking, useful for measuring the contribution of right context; it is
+        not intended as a separate training method.
+
+        Args:
+            documents (list[list[str]]): Documents represented as ordered lists
+                of text chunks.
+            batch_size (int): Number of input documents processed per batch.
+
+        Returns:
+            list[list[torch.Tensor]]: One embedding per input chunk, in the same
+            document and chunk order as ``documents``.  Embedding shape and
+            normalization follow :meth:`embed_documents`.
+        """
+        return self._embed_documents_directional(documents, batch_size, "right")
 
     def gradient_checkpointing_enable(self, **kwargs):
         """

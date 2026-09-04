@@ -34,11 +34,11 @@ DATASETS = [
     "covid-qa",
     "geography",
     # "esg-reports",
-    # "insurance",
-    # "football",
-    # "squad-conteb-eval",
-    # "narrative-qa",
-    # "mldr-conteb-eval",
+    "insurance",
+    "football",
+    "squad-conteb-eval",
+    "narrative-qa",
+    "mldr-conteb-eval",
 ]
 
 SQUAD_CHUNK_SIZES = [8000, 1000, 500, 300, 250, 200, 175, 150, 125, 100]
@@ -123,7 +123,7 @@ def get_model(
             return LateInteractionContextualEmbedder(base_model, add_prefix=use_prefix, device=DEVICE)
         case "sentence_transformer":
             return SentenceTransformerEmbedder(base_model, add_prefix=use_prefix, batch_size=128, device=DEVICE,
-                                               normalize_embeddings=True, quantization="binary")
+                                               normalize_embeddings=True)
         case "colbert":
             if extend_context:
                 batch_size = 1

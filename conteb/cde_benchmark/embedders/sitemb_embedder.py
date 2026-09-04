@@ -336,6 +336,16 @@ class SitEmbContextualEmbedder(_SitEmbBase):
             lengths.append(len(chunks))
         contextual, residual = self._encode_passages(texts, batch_size=batch_size, residual=True)
         embeddings = contextual * (1.0 - self.residual_factor) + residual * self.residual_factor
+        
+        # 1️⃣ embedding-level normalization
+        # normalize the combined embeddings if normalization is enabled
+        # if self.normalize_embeddings:
+        #     embeddings = F.normalize(embeddings, p=2, dim=-1)
+
+        # 2️⃣ similarity-level normalization
+        # otherwise, default
+
+        
         result = []
         offset = 0
         for length in lengths:

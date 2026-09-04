@@ -2,9 +2,6 @@
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
-[tool.hatch.version]
-source = "vcs"
-
 [tool.hatch.metadata]
 allow-direct-references = true
 
@@ -13,7 +10,7 @@ include = ["cde_benchmark"]
 
 [project]
 name = "cde_benchmark"
-dynamic = ["version"]
+version = "0.0.0"
 description = "The code used to train and run inference with the OptimusVLM architecture."
 authors = [
     { name = "Manuel Faysse", email = "manuel.faysse@illuin.tech" },
@@ -40,7 +37,7 @@ dependencies = [
     "voyageai>=0.5.0; python_version < '3.13'",
     "peft>=0.14.0",
     "transformers>=4.51.0",
-    "contextual-embeddings @ file:///root/kyx/contextual-embeddings",
+    "contextual-embeddings",
 ]
 
 [project.optional-dependencies]
@@ -53,8 +50,20 @@ all = ["cde_benchmark"]
 [project.urls]
 homepage = "https://github.com/ManuelFay/contextualized-embeddings-benchmark"
 
+[dependency-groups]
+dev = [
+    "matplotlib>=3.11.1",
+    "seaborn>=0.13.2",
+]
+
 [tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
+flash-attn = ["torch>=2.8.0,<2.9.0"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+contextual-embeddings = { path = "../contextual-embeddings", editable = true }
 
 [tool.pytest.ini_options]
 filterwarnings = ["ignore::Warning"]
