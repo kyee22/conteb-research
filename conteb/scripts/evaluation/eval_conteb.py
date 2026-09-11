@@ -9,6 +9,8 @@ import typer
 from huggingface_hub import HfApi, hf_hub_download
 # from pylate.models import ColBERT
 from sentence_transformers import SentenceTransformer
+from contextual_embeddings import HyperContextEmbeddingModel
+from contextual_embeddings import HyperContextEmbeddingModel
 from datasets import get_dataset_config_names, get_dataset_split_names
 
 from cde_benchmark.embedders.base_embedder import Embedder
@@ -19,6 +21,7 @@ from cde_benchmark.embedders.contextual_embedder import (
     MergedContextualEmbedder,
     PPLXContextualEmbedder,
 )
+from cde_benchmark.embedders.hyper_contextual_embedder import HyperContextualEmbedder
 from cde_benchmark.embedders.sentence_transformer_embedder import SentenceTransformerEmbedder
 from cde_benchmark.embedders.sitemb_embedder import (
     Qwen3Embedder,
@@ -53,7 +56,8 @@ def get_model(
     Args:
         base_model (SentenceTransformer): The base model to use.
         model_type (str): The type of model to use. Can be one of
-          "contextual", "merged_contextual", "late_interaction", or "sentence_transformer".
+          "contextual", "hyper_contextual", "merged_contextual", "late_interaction", or
+          "sentence_transformer".
         use_prefix (bool): Whether to add prefixes to the chunks and queries.
     """
     if model_type == 'pplx_contextual':
@@ -107,8 +111,14 @@ def get_model(
         #     base_model = ColBERT(model_path, device=DEVICE, document_length=sys.maxsize)
         # else:
         #     base_model = ColBERT(model_path, device=DEVICE)
+    if model_type in {"hyper_contextual", "hypernet_contextual"}:
+        model = HyperContextEmbeddingModel.from_checkpoint(model_path, add_prefix=use_prefix)
+        print(f"Loaded hypernetwork checkpoint from {model_path}")
+        return HyperContextualEmbedder(model, device=DEVICE)
+
     else:
         base_model = SentenceTransformer(model_path, trust_remote_code=True, device=DEVICE)
+        print(f"Load base model @ {model_path}")
 
     if extend_context:
         base_model.max_seq_length = sys.maxsize

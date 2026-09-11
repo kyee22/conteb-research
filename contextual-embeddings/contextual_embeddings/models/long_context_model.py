@@ -20,6 +20,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
         add_prefix: bool = False,
         show_progress_bar: bool = True,
         quantization: str = None,
+        query_micro_batch_size: Optional[int] = None,
     ):
         super().__init__()
 
@@ -34,6 +35,8 @@ class LongContextEmbeddingModel(SentenceTransformer):
             len(base_model.tokenizer(doc_prefix_str, add_special_tokens=True)["input_ids"]) - 1
         )  # - 1 to remove the [SEP] token (but count the [CLS] token)
         self.show_progress_bar = show_progress_bar
+        
+        self.query_micro_batch_size = query_micro_batch_size
 
         # test fix for models that do not have a sep_token (decoders)
         if self.base_model.tokenizer.sep_token is None:
@@ -862,7 +865,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
             list[list[torch.Tensor]]: A list of lists of embeddings, where each inner list corresponds to a document,
             and contains the embeddings of the chunks in that document."""
 
-        return self.embed_documents_right(documents, batch_size)
+        # return self.embed_documents_right(documents, batch_size)
 
 
         # For max{document} <= max_seq_length
