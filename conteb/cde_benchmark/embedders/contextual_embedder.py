@@ -3,6 +3,10 @@ from contextual_embeddings import LongContextEmbeddingModel
 from sentence_transformers import SentenceTransformer
 
 from cde_benchmark.embedders.base_embedder import Embedder
+from cde_benchmark.embedders.hyper_contextual_embedder import (
+    HyperContextEmbedder,
+    HyperContextualEmbedder,
+)
 from transformers import AutoModel
 
 

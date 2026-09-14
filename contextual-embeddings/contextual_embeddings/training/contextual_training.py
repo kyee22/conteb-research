@@ -29,6 +29,7 @@ class ContextualTrainingConfig:
     loss_type: str = "inbatch_inseq"
     add_prefixes: bool = False
     colbert_tokenize: bool = False
+    chunk_encoding_mode: str = "late"
 
     def __post_init__(self):
         """
@@ -85,6 +86,7 @@ class ContextualTraining:
                 sep_token=self.model.base_model.tokenizer.sep_token,
                 add_prefixes=self.config.add_prefixes,
                 colbert_tokenize=self.config.colbert_tokenize,
+                chunk_encoding_mode=self.config.chunk_encoding_mode,
             ),
         )
 
