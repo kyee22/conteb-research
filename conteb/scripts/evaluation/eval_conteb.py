@@ -2,7 +2,16 @@ import json
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import List
+
+# Support running this file directly from a sibling project, e.g.
+# ``cd contextual-embeddings && uv run ../conteb/scripts/evaluation/eval_conteb.py``.
+# In that case uv installs the contextual-embeddings project, but does not add
+# the conteb source tree (which contains cde_benchmark) to sys.path.
+_CONTEB_ROOT = Path(__file__).resolve().parents[2]
+if str(_CONTEB_ROOT) not in sys.path:
+    sys.path.insert(0, str(_CONTEB_ROOT))
 
 import torch
 import typer
@@ -21,6 +30,7 @@ from cde_benchmark.embedders.contextual_embedder import (
     MergedContextualEmbedder,
     PPLXContextualEmbedder,
 )
+from cde_benchmark.embedders.flex_contextual_embedder import FlexContextualEmbedder
 from cde_benchmark.embedders.hyper_contextual_embedder import HyperContextualEmbedder
 from cde_benchmark.embedders.sentence_transformer_embedder import SentenceTransformerEmbedder
 from cde_benchmark.embedders.sitemb_embedder import (
@@ -56,7 +66,7 @@ def get_model(
     Args:
         base_model (SentenceTransformer): The base model to use.
         model_type (str): The type of model to use. Can be one of
-          "contextual", "hyper_contextual", "merged_contextual", "late_interaction", or
+          "contextual", "flex_contextual", "hyper_contextual", "merged_contextual", "late_interaction", or
           "sentence_transformer".
         use_prefix (bool): Whether to add prefixes to the chunks and queries.
     """
@@ -116,6 +126,21 @@ def get_model(
         print(f"Loaded hypernetwork checkpoint from {model_path}")
         return HyperContextualEmbedder(model, device=DEVICE)
 
+    # Flex checkpoints keep replace_local_with/replace_full_with in
+    # training_config.yml; load through the adapter so the CLI does not lose
+    # those settings by constructing a plain SentenceTransformer first.
+    if model_type in {"flex_contextual", "flex"}:
+        embedder = FlexContextualEmbedder.from_checkpoint(
+            model_path,
+            add_prefix=use_prefix,
+            device=DEVICE,
+        )
+        if extend_context:
+            embedder.base_model.max_seq_length = sys.maxsize
+            embedder.base_model.tokenizer.model_max_length = sys.maxsize
+        print(f"Loaded Flex contextual checkpoint from {model_path}")
+        return embedder
+
     else:
         base_model = SentenceTransformer(model_path, trust_remote_code=True, device=DEVICE)
         print(f"Load base model @ {model_path}")
@@ -132,7 +157,7 @@ def get_model(
         case "late_interaction" | "li":
             return LateInteractionContextualEmbedder(base_model, add_prefix=use_prefix, device=DEVICE)
         case "sentence_transformer":
-            return SentenceTransformerEmbedder(base_model, add_prefix=use_prefix, batch_size=128, device=DEVICE,
+            return SentenceTransformerEmbedder(base_model, add_prefix=use_prefix, batch_size=32, device=DEVICE,
                                                normalize_embeddings=True)
         case "colbert":
             if extend_context:
@@ -196,6 +221,24 @@ def eval_model(
 
     metrics = {}
 
+    # Evaluate on NanoBEIR (non-contextual task, 1 chunk per document)
+    if run_nanobeir:
+        print("Running NanoBEIR tasks...")
+        nanobeir = NanoBEIR(f"zeta-alpha-ai", embedder)
+        nanobeir_metrics = nanobeir.run_all_tasks()
+        nanobeir_macro_average = nanobeir_metrics.pop("macro_average", {})
+        nanobeir_average = nanobeir_metrics.pop("average", {})
+        metrics.update(nanobeir_metrics)
+        print("NanoBEIR macro-average (equal task weighting):")
+        metrics["NanoBEIR_macro_average"] = nanobeir_macro_average
+        for name, value in nanobeir_macro_average.items():
+            print(f"\t{name}: {value}")
+        print("NanoBEIR pooled average (query weighting):")
+        metrics["NanoBEIR_average"] = nanobeir_average
+        for name, value in nanobeir_average.items():
+            print(f"\t{name}: {value}")
+
+    # Evaluate on ConTEB (contextual task, >1 chunks per document)
     for dataset in datasets:
         ds_path = f"{data_base_path}/{dataset}"
         split = get_split(ds_path)
@@ -237,10 +280,7 @@ def eval_model(
             for k, v in ds_metrics.items():
                 print(f"\t{k}: {v}")
 
-    if run_nanobeir:
-        nanobeir = NanoBEIR(f"{data_base_path}/nanobeir", embedder)
-        nanobeir_metrics = nanobeir.run_all_tasks()
-        metrics.update(nanobeir_metrics)
+
 
     if run_longembed:
         print("Running LongEmbed tasks...")

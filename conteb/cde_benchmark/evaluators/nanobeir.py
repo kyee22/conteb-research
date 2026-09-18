@@ -1,3 +1,5 @@
+import numbers
+
 from cde_benchmark.embedders.sentence_transformer_embedder import (
     SentenceTransformerEmbedder,
 )
@@ -31,15 +33,45 @@ class NanoBEIR:
             self.path + "/" + task, "train", query_prompt=self.query_prompt, doc_prompt=self.doc_prompt
         )
         metrics = self.embedder.compute_metrics_e2e(formatter)
-        return metrics
+        return metrics, len(formatter.queries_dataset)
 
     def run_all_tasks(self):
         results = {}
+        task_support = {}
         for task in self.datasets:
             print(f"Running task: {task}")
-            res = self.run_task(task)
+            res, support = self.run_task(task)
             print(res)
             results[task] = res
+            task_support[task] = support
+        # Macro-average each scalar metric across the 13 NanoBEIR tasks.
+        # Keep per-task results intact so callers can inspect task variance.
+        metric_names = sorted({name for task_metrics in results.values() for name in task_metrics})
+        macro_average = {
+            name: sum(
+                float(task_metrics[name])
+                for task_metrics in results.values()
+                if name in task_metrics and isinstance(task_metrics[name], numbers.Number)
+            ) / sum(
+                1
+                for task_metrics in results.values()
+                if name in task_metrics and isinstance(task_metrics[name], numbers.Number)
+            )
+            for name in metric_names
+            if any(name in task_metrics and isinstance(task_metrics[name], numbers.Number)
+                   for task_metrics in results.values())
+        }
+        average = {
+            name: sum(float(results[task][name]) * task_support[task] for task in results
+                      if name in results[task] and isinstance(results[task][name], numbers.Number)) / sum(
+                task_support[task] for task in results
+                if name in results[task] and isinstance(results[task][name], numbers.Number)
+            )
+            for name in metric_names
+            if any(name in results[task] and isinstance(results[task][name], numbers.Number) for task in results)
+        }
+        results["macro_average"] = macro_average
+        results["average"] = average
         return results
 
 

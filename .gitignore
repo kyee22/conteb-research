@@ -105,3 +105,5 @@ node_modules/
 # Local AI-agent configuration
 .agents/
 .codex/
+
+contextual-embeddings/trainer_output/

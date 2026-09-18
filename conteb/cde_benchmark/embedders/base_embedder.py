@@ -70,7 +70,7 @@ class Embedder:
                 doc_embeddings = [embed_ for nested_embeds in doc_embeddings for embed_ in nested_embeds]
             elif self.is_contextual_model and self._has_formatter_beir_format(data_formatter):
                 documents, document_ids = data_formatter.get_flattened()
-                doc_embeddings = self.embed_documents([[doc] for doc in documents])
+                doc_embeddings = self.embed_documents([[doc] for doc in documents], batch_size=64 * 20)
                 doc_embeddings = [embed_ for nested_embeds in doc_embeddings for embed_ in nested_embeds]
             else:
                 documents, document_ids = (

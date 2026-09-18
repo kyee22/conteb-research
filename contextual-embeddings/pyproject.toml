@@ -18,7 +18,6 @@ dependencies = [
     "accelerate>=1.7.0",
     "configue>=5.0.0",
     "datasets>=3.2.0",
-    "flash-attn==2.8.3.post1",
     "numpy<2",
     "pylate>=1.2.0",
     "sentence-transformers>=3.3.1",
@@ -32,14 +31,6 @@ dependencies = [
 dev-dependencies = [
     "pytest>=8.3.4",
 ]
-no-build-isolation-package = ["flash-attn"]
-
-[tool.uv.extra-build-dependencies]
-# Ensure flash-attn's isolated build sees the same CUDA 12.8 PyTorch wheel
-# used at runtime (otherwise uv may select a newer CPU/CUDA variant).
-flash-attn = ["torch>=2.8.0,<2.9.0"]
-
-
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 

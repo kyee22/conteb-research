@@ -9,6 +9,10 @@ from cde_benchmark.embedders.hyper_contextual_embedder import (
 )
 from transformers import AutoModel
 
+# Kept importable from the historical contextual embedder module for callers
+# that group all contextual adapters in one place.
+from cde_benchmark.embedders.flex_contextual_embedder import FlexContextualEmbedder
+
 
 class ContextualEmbedder(LongContextEmbeddingModel, Embedder):
     def __init__(
