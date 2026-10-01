@@ -166,6 +166,7 @@ dependencies = [
     { name = "torch" },
     { name = "transformers" },
     { name = "voyageai" },
+    { name = "wandb" },
 ]
 
 [package.optional-dependencies]
@@ -193,6 +194,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.2.0" },
     { name = "transformers", specifier = ">=4.51.0" },
     { name = "voyageai", marker = "python_full_version < '3.13'", specifier = ">=0.5.0" },
+    { name = "wandb", specifier = ">=0.28.1" },
 ]
 provides-extras = ["dev", "all"]
 

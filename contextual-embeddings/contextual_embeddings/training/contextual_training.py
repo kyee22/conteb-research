@@ -68,7 +68,7 @@ class ContextualTraining:
         self.config = config
         self.model = config.model
 
-    def train(self):
+    def train(self, resume_from_checkpoint: Optional[str] = None):
         """
         Train the model using the provided configuration.
         """
@@ -83,14 +83,22 @@ class ContextualTraining:
             data_collator=ContextualDataCollator(
                 tokenize_fn=self.model.tokenize,
                 is_multi_ctx_training=self.config.multi_ctx_training,
-                sep_token=self.model.base_model.tokenizer.sep_token,
+                sep_token=getattr(self.model, "chunk_separator", None)
+                or getattr(self.model, "dataset_separator", None)
+                or self.model.base_model.tokenizer.sep_token
+                or getattr(self.model.base_model.tokenizer, "pad_token", None)
+                or "<|endoftext|>",
                 add_prefixes=self.config.add_prefixes,
                 colbert_tokenize=self.config.colbert_tokenize,
                 chunk_encoding_mode=self.config.chunk_encoding_mode,
+                query_template=getattr(self.model, "query_prompt_template", None),
+                query_prefix=getattr(self.model, "query_prefix", None),
+                document_prefix=getattr(self.model, "document_prefix", None),
+                offset_document_tokenize=getattr(self.model, "_offset_tokenize_documents", None),
             ),
         )
 
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     def save(self, config_file):
         """

@@ -8,8 +8,17 @@ N_SPECIAL_TOKENS = 3  # to be safe, we imagine the tokenizer will add 3 special 
 def get_dataset_from_beir_format(
     queries: Dataset,
     chunks: Dataset,
-    sep_token: str,
+    sep_token: str | None,
 ) -> Dataset:
+    """Group BEIR chunks and queries without requiring a tokenizer SEP token.
+
+    ``sep_token`` is only used to populate the legacy concatenated ``docs``
+    field. If absent, use the tokenizer's padding/terminal token when available.
+    Offset-based Qwen3 training uses ``docs_list`` later; this text separator is
+    not used to infer Qwen3 token boundaries.
+    """
+    if not sep_token:
+        sep_token = "<|endoftext|>"
     # Extract ids for both queries and chunks (format is always docID_chunkID)
     def extract_ids(sample):
         split = sample["chunk_id"].split("_")
@@ -61,7 +70,7 @@ def get_chunked_mldr_st(path, base_model, split="train", all_queries=True, filte
             return sample
 
         ds_docs = ds_docs.map(extract_n_tokens)
-        ds_docs = ds_docs.filter(lambda x: x["n_tokens"] < base_model.max_seq_length - N_SPECIAL_TOKENS)
+        ds_docs = ds_docs.filter(lambda x: x["n_tokens"] < 8192 - N_SPECIAL_TOKENS)
 
     ds_queries = load_dataset(path, "queries", split=split)
     if all_queries:
@@ -89,11 +98,19 @@ def create_contextual_dataset(path, base_model, split="train", all_queries=True,
         ds_queries = concatenate_datasets([ds_queries, ds_synthetic])
 
     print(f"Number of total queries: {len(ds_queries)}")
-    dataset = get_dataset_from_beir_format(ds_queries, ds_docs, base_model.tokenizer.sep_token)
+    dataset_separator = getattr(base_model, "dataset_separator", None)
+    if dataset_separator is None:
+        tokenizer = base_model.tokenizer
+        dataset_separator = (
+            getattr(tokenizer, "sep_token", None)
+            or getattr(tokenizer, "pad_token", None)
+            or "<|endoftext|>"
+        )
+    dataset = get_dataset_from_beir_format(ds_queries, ds_docs, dataset_separator)
 
     if filter_long_samples:
         dataset = dataset.filter(
-            lambda x: len(base_model.tokenizer(x["docs"]).input_ids) < base_model.max_seq_length - N_SPECIAL_TOKENS
+            lambda x: len(base_model.tokenizer(x["docs"]).input_ids) < 8192 - N_SPECIAL_TOKENS
         )
 
     def remove_bad_queries(sample):
@@ -120,7 +137,7 @@ def get_nomic_clusters_dataset(path, base_model, split="train", num_proc=64):
     dataset = dataset.map(extract_n_tokens)
 
     dataset = dataset.filter(
-        lambda x: x["n_tokens"] < base_model.max_seq_length - N_SPECIAL_TOKENS,
+        lambda x: x["n_tokens"] < 8192 - N_SPECIAL_TOKENS,
     )
 
     return dataset
@@ -170,7 +187,7 @@ def get_nomic_st(path, base_model, split="train"):
     dataset = dataset.map(extract_n_tokens)
 
     dataset = dataset.filter(
-        lambda x: x["n_tokens"] < base_model.max_seq_length - N_SPECIAL_TOKENS,
+        lambda x: x["n_tokens"] < 8192 - N_SPECIAL_TOKENS,
     )
 
     # only keep query and document fields

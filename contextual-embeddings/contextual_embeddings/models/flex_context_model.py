@@ -40,6 +40,9 @@ class _FlexModernBertMixin:
         k_valid = valid[:, None, :]
         if mode == "full":
             visible = q_valid & k_valid
+        elif mode == "causal":
+            # Each token can attend to itself and tokens to its left.
+            visible = q_valid & k_valid & (q >= k)
         elif mode == "sliding_window":
             # ModernBertConfig exposes the effective radius as
             # ``sliding_window`` in recent Transformers; older checkpoints
@@ -132,7 +135,7 @@ class FlexLongContextEmbeddingModel(LongContextEmbeddingModel):
         super().__init__(base_model=base_model, **kwargs)
         self.replace_local_with = replace_local_with
         self.replace_full_with = replace_full_with
-        valid_modes = {"full", "sliding_window", "chunk"}
+        valid_modes = {"full", "causal", "sliding_window", "chunk"}
         if replace_local_with not in valid_modes or replace_full_with not in valid_modes:
             raise ValueError(f"attention replacement modes must be in {sorted(valid_modes)}")
         auto_model = getattr(self.base_model[0], "auto_model", None)

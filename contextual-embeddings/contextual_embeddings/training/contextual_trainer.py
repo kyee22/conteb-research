@@ -16,12 +16,25 @@ class ContextualTrainer(SentenceTransformerTrainer):
         return_outputs: bool = False,
         num_items_in_batch=None,
     ) -> Tensor | tuple[Tensor, dict[str, Any]]:
+        """Collect features and call the model's contextual loss function.
+
+        ``collect_features`` removes the ``queries_`` and ``docs_`` prefixes
+        from collator tensors. Non-tensor metadata is forwarded separately:
+        ``chunk_offsets`` identifies document content spans and must never be
+        sent through tensor device movement or dropped by the trainer.
+
+        Returns either a scalar loss or ``(loss, {})`` when the trainer asks for
+        outputs during evaluation.
+        """
         features, _ = self.collect_features(inputs)
 
         # Pass everything to the model and compute the loss in the model directly
         features_dict = {
             "query_inputs": {k: v for k, v in features[0].items()},
             "docs_inputs": {k: v for k, v in features[1].items()},
+            "chunk_offsets": inputs.get("chunk_offsets"),
+            "queries_chunk_indices": inputs["queries_chunk_indices"],
+            "n_docs_per_sample": inputs.get("n_docs_per_sample"),
         }
 
         model_outputs = model(

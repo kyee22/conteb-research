@@ -36,6 +36,8 @@ class LongContextEmbeddingModel(SentenceTransformer):
         )  # - 1 to remove the [SEP] token (but count the [CLS] token)
         self.show_progress_bar = show_progress_bar
         
+        if query_micro_batch_size is not None and query_micro_batch_size <= 0:
+            raise ValueError("query_micro_batch_size must be a positive integer or None")
         self.query_micro_batch_size = query_micro_batch_size
 
         # test fix for models that do not have a sep_token (decoders)

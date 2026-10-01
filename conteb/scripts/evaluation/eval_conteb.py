@@ -38,14 +38,16 @@ from cde_benchmark.embedders.sitemb_embedder import (
     SitEmbChunkOnlyEmbedder,
     SitEmbContextualEmbedder,
 )
+from cde_benchmark.embedders.qwen3_late_chunking_embedder import Qwen3LateChunkingEmbedder
 from cde_benchmark.embedders.voyage_contextual_embedder import VoyageContextualEmbedder
 from cde_benchmark.evaluators.longembed import LongEmbedEvaluator
 from cde_benchmark.evaluators.nanobeir import NanoBEIR
 from cde_benchmark.formatters.data_formatter import DataFormatter
 
 DATASETS = [
-    "covid-qa",
-    "geography",
+       "geography",
+       "covid-qa",
+ 
     # "esg-reports",
     "insurance",
     "football",
@@ -107,6 +109,8 @@ def get_model(
             device=DEVICE,
             torch_dtype=torch.bfloat16 if DEVICE.startswith("cuda") else None,
         )
+    if model_type in {"qwen3_late", "qwen3_late_chunking"}:
+        return Qwen3LateChunkingEmbedder.from_checkpoint(model_path, device=DEVICE)
 
     if model_type == 'voyage':
         return VoyageContextualEmbedder(
@@ -204,7 +208,7 @@ def eval_model(
     run_longembed: bool = False,
     use_prefix: bool = False,
     data_base_path: str = "illuin-conteb",
-    save_dir: str = "results",
+    save_dir: str = "results-qwen3",
     extend_context: bool = False,
 ):
     embedder = get_model(model_path, colbert_model, model_type, use_prefix, extend_context)
@@ -264,7 +268,7 @@ def eval_model(
     os.makedirs(save_dir, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(output_dic, f, indent=4)
-
+    print(f"Metrics saved to {output_path}!")
     if run_squad_chunked:
         for chunk_size in SQUAD_CHUNK_SIZES:
             ds_path = f"{data_base_path}/squad-chunked-par-{chunk_size}"

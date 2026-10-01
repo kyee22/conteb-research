@@ -21,7 +21,7 @@ DEFAULT_BASE_MODEL = "Qwen/Qwen3-Embedding-8B"
 CHUNK_ONLY_ADAPTER = "SituatedEmbedding/SitEmb-v1.5-Qwen3-chunk-only"
 CONTEXT_ADAPTER = "SituatedEmbedding/SitEmb-v1.5-Qwen3"
 DEFAULT_QUERY_TEMPLATE = (
-    "Instruct: Given a search query, retrieve relevant chunks from fictions that answer the query\n"
+    "Instruct: task = 'Given a web search query, retrieve relevant passages that answer the query\n"
     "Query:{query}"
 )
 PASSAGE_AFFIX = (
