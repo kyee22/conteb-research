@@ -1,6 +1,6 @@
 multi_ctx_training: True
 attention_mode: "bidirectional"                # {"causal", "bidirectional", "chunk_bidirectional_causal"}
-query_pooling: "last_token"             # {"last_token", "mean"}
+query_pooling: "mean"             # {"last_token", "mean"}
 document_pooling: "late_chunking_mean"  # {"late_chunking_mean", "late_chunking_last_token"}
 base_model:
   (): sentence_transformers.SentenceTransformer

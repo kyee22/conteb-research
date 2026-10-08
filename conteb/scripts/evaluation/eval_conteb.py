@@ -208,7 +208,7 @@ def eval_model(
     run_longembed: bool = False,
     use_prefix: bool = False,
     data_base_path: str = "illuin-conteb",
-    save_dir: str = "results-qwen3",
+    save_dir: str = "results-qwen3-gather",
     extend_context: bool = False,
 ):
     embedder = get_model(model_path, colbert_model, model_type, use_prefix, extend_context)

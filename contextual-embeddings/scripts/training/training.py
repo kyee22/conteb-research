@@ -23,7 +23,8 @@ def main(config_file: Path, lambda_seq: float = -1.0) -> None:
 
     if config.run_train:
         print("Training model")
-        app.train(resume_from_checkpoint="trainer_output/checkpoint-1000")
+        # app.train(resume_from_checkpoint="trainer_output/checkpoint-1000")
+        app.train()
         app.save(config_file=config_file)
 
     """if config.run_eval:
