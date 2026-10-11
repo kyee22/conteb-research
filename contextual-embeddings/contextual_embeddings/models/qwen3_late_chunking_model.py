@@ -95,6 +95,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         self.query_template = query_template
         print(f"Qwen3LateChunkingModel: attention_mode={attention_mode}, query_pooling={query_pooling}, document_pooling={document_pooling}")
         print(f"Qwen3LateChunkingModel: query_template={query_template}")
+            print(f"Qwen3LateChunkingModel: lambda_seq={self.lambda_seq}")
         self.query_prefix = ""
         self.document_prefix = ""
         self.normalize_embeddings = kwargs.pop("normalize_embeddings", True)
@@ -296,7 +297,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 return args, kwargs
             valid = valid.bool()
             bsz, length = ref.shape[:2]
-            visible = valid[:, None, :, None] & valid[:, None, None, :]
+            # Keep visibility as (batch, query_position, key_position) until
+            # the final explicit head-dimension insertion. Mixing a
+            # (B,1,L,L) tensor with a (B,L,L) chunk relation broadcasts to
+            # (B,B,L,L) when B > 1.
+            visible = valid[:, :, None] & valid[:, None, :]
             if self.attention_mode == "chunk_bidirectional_causal":
                 # Query sequences have no document chunk offsets. Keep their
                 # normal causal mask; the chunk-aware mask is document-only.
@@ -312,9 +317,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                         if end < length and bool(valid[row, end]):
                             groups[row, end] = group
                 qg, kg = groups[:, :, None], groups[:, None, :]
-                visible = valid[:, None, :, None] & valid[:, None, None, :] & ((qg == kg) | (kg < qg))
+                visible = visible & ((qg == kg) | (kg < qg))
             additive = torch.zeros((bsz, 1, length, length), dtype=torch.float32, device=ref.device)
-            kwargs["attention_mask"] = additive.masked_fill(~visible, torch.finfo(additive.dtype).min)
+            kwargs["attention_mask"] = additive.masked_fill(
+                ~visible[:, None, :, :], torch.finfo(additive.dtype).min
+            )
             return args, kwargs
         self.base_model[0].auto_model._qwen3_late_hook = self.base_model[0].auto_model.register_forward_pre_hook(hook, with_kwargs=True)
 
@@ -469,6 +476,85 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             labels = torch.cat([torch.tensor(ix, device=scores.device) + offsets[i] for i, ix in enumerate(indices)])
         return self.cross_entropy_loss(scores, labels)
 
+    def _compute_loss_from_embeddings(self, queries, documents, labels):
+        """Compute in-sequence cross-entropy for one sample's documents.
+
+        ``queries`` has shape ``(n_queries, hidden_size)`` and ``documents``
+        has shape ``(n_documents, hidden_size)``. ``labels`` contains the
+        document index for each query. This is the in-sequence component used
+        by ModernBERT's weighted loss.
+        """
+        scores = self._compute_sim(queries, documents) * self.sim_score_scale
+        return self.cross_entropy_loss(scores, labels)
+
+    def _compute_loss_batch_negatives(self, queries, batch_negatives, gold_documents):
+        """Compute the in-batch-negative component for one training sample.
+
+        ``gold_documents`` contains the positive document for each query and
+        ``batch_negatives`` contains valid documents from other examples. The
+        positive score is placed in column zero, matching the parent model's
+        label convention.
+        """
+        if queries.shape[0] != gold_documents.shape[0]:
+            raise ValueError("queries and gold_documents must have equal length")
+        gold_scores = (F.normalize(queries, dim=-1) * F.normalize(gold_documents, dim=-1)).sum(-1)
+        if batch_negatives.numel():
+            negative_scores = self._compute_sim(queries, batch_negatives)
+            scores = torch.cat([gold_scores[:, None], negative_scores], dim=1)
+        else:
+            scores = gold_scores[:, None]
+        labels = torch.zeros(queries.shape[0], dtype=torch.long, device=queries.device)
+        return self.cross_entropy_loss(scores * self.sim_score_scale, labels)
+
+    def _compute_loss_inbatch_inseq(self, queries, chunks, padding, indices, n_docs_per_sample=None):
+        """Compute the parent's global in-batch/in-sequence objective.
+
+        All valid chunks in the device batch become columns in one logits
+        matrix. In multi-context mode, labels are offset by each sample's
+        padded chunk width; in single-context mode they are offset by the
+        actual number of chunks in preceding samples.
+        """
+        flat = chunks.reshape(-1, chunks.shape[-1])
+        scores = self._compute_sim(queries, flat) * self.sim_score_scale
+        scores = scores.masked_fill(padding.reshape(1, -1), float("-inf"))
+        if self.multi_ctx_training:
+            max_docs = chunks.shape[1]
+            labels = torch.cat([
+                torch.tensor(sample_indices, device=queries.device) + sample_idx * max_docs
+                for sample_idx, sample_indices in enumerate(indices)
+            ])
+        else:
+            if n_docs_per_sample is None:
+                raise ValueError("n_docs_per_sample is required when multi_ctx_training is false")
+            offsets = torch.tensor([0] + n_docs_per_sample[:-1], device=queries.device).cumsum(0)
+            labels = torch.cat([
+                torch.tensor(sample_indices, device=queries.device) + offsets[sample_idx]
+                for sample_idx, sample_indices in enumerate(indices)
+            ])
+        return self.cross_entropy_loss(scores, labels)
+
+    def _compute_loss_weighted(self, queries, chunks, padding, indices):
+        """Compute ModernBERT's ``lambda_seq`` weighted objective.
+
+        For each sample, the loss is ``lambda_seq * in_sequence_loss +
+        (1-lambda_seq) * in_batch_loss``. Thus changing ``lambda_seq`` changes
+        the scalar objective while preserving the same positives and negatives.
+        """
+        batch_size = chunks.shape[0]
+        query_offset = 0
+        sequence_losses, batch_losses = [], []
+        for sample_idx in range(batch_size):
+            valid_docs = chunks[sample_idx][~padding[sample_idx]]
+            sample_indices = indices[sample_idx]
+            sample_queries = queries[query_offset:query_offset + len(sample_indices)]
+            query_offset += len(sample_indices)
+            labels = torch.tensor(sample_indices, dtype=torch.long, device=queries.device)
+            sequence_losses.append(self._compute_loss_from_embeddings(sample_queries, valid_docs, labels))
+            other = torch.arange(batch_size, device=chunks.device) != sample_idx
+            batch_negatives = chunks[other][~padding[other]]
+            batch_losses.append(self._compute_loss_batch_negatives(sample_queries, batch_negatives, valid_docs[labels]))
+        return self.lambda_seq * torch.stack(sequence_losses).mean() + (1 - self.lambda_seq) * torch.stack(batch_losses).mean()
+
     def forward(self, *args, **kwargs):
         """Run one contextual training/evaluation batch.
 
@@ -493,7 +579,21 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             chunks, padding = self._encode_documents_microbatched(
                 batch["docs_inputs"], batch["chunk_offsets"]
             )
-            return {"loss": self._compute_loss(queries, chunks, padding, batch["queries_chunk_indices"], batch.get("n_docs_per_sample"))}
+            loss_type = kwargs.get("loss_type", "weighted")
+            if loss_type == "weighted":
+                loss = self._compute_loss_weighted(queries, chunks, padding, batch["queries_chunk_indices"])
+            elif loss_type == "inbatch_inseq":
+                loss = self._compute_loss_inbatch_inseq(
+                    queries, chunks, padding, batch["queries_chunk_indices"], batch.get("n_docs_per_sample")
+                )
+            elif loss_type == "late_interaction":
+                raise ValueError(
+                    "loss_type='late_interaction' requires token-level query/document pooling; "
+                    "Qwen3LateChunkingModel currently produces one vector per chunk"
+                )
+            else:
+                raise ValueError("Unknown loss_type. Supported values: weighted, inbatch_inseq, late_interaction")
+            return {"loss": loss}
         finally:
             self._active_chunk_offsets = None
 
