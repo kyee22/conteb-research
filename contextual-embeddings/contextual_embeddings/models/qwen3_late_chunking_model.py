@@ -95,13 +95,13 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         self.query_template = query_template
         print(f"Qwen3LateChunkingModel: attention_mode={attention_mode}, query_pooling={query_pooling}, document_pooling={document_pooling}")
         print(f"Qwen3LateChunkingModel: query_template={query_template}")
-            print(f"Qwen3LateChunkingModel: lambda_seq={self.lambda_seq}")
         self.query_prefix = ""
         self.document_prefix = ""
         self.normalize_embeddings = kwargs.pop("normalize_embeddings", True)
         self.sim_score_scale = kwargs.pop("sim_score_scale", 20.0)
         self.multi_ctx_training = kwargs.pop("multi_ctx_training", True)
         self.lambda_seq = kwargs.pop("lambda_seq", 0.5)
+        print(f"Qwen3LateChunkingModel: lambda_seq={self.lambda_seq}")
         self.show_progress_bar = kwargs.pop("show_progress_bar", True)
         self.batch_size = kwargs.pop("batch_size", 16)
         self.query_micro_batch_size = self._validate_micro_batch_size(
@@ -291,6 +291,10 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             """Rewrite a 2-D validity mask into the selected 4-D additive mask."""
             if self.attention_mode == "causal":
                 return args, kwargs
+            # Query forwards never carry document chunk offsets. Keep them on
+            # Qwen3's native causal mask for every configured document mode.
+            if not getattr(self, "_active_chunk_offsets", None):
+                return args, kwargs
             ref = kwargs.get("input_ids", args[0] if args else kwargs.get("inputs_embeds"))
             valid = kwargs.get("attention_mask", args[1] if len(args) > 1 else None)
             if ref is None or valid is None or valid.ndim != 2:
@@ -303,10 +307,6 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             # (B,B,L,L) when B > 1.
             visible = valid[:, :, None] & valid[:, None, :]
             if self.attention_mode == "chunk_bidirectional_causal":
-                # Query sequences have no document chunk offsets. Keep their
-                # normal causal mask; the chunk-aware mask is document-only.
-                if not getattr(self, "_active_chunk_offsets", None):
-                    return args, kwargs
                 groups = torch.full((bsz, length), -1, dtype=torch.long, device=ref.device)
                 for row, row_offsets in enumerate(getattr(self, "_active_chunk_offsets", [])):
                     for group, (start, end) in enumerate(row_offsets):
