@@ -1,5 +1,5 @@
 multi_ctx_training: True
-attention_mode: "causal"                # {"causal", "bidirectional", "chunk_bidirectional_causal"}
+attention_mode: "chunk_bidirectional_causal"                # {"causal", "bidirectional", "chunk_bidirectional_causal"}
 query_pooling: "last_token"             # {"last_token", "mean"}
 document_pooling: "late_chunking_mean"  # {"late_chunking_mean", "late_chunking_last_token"}
 base_model:
@@ -22,7 +22,7 @@ config:
     query_pooling: !cfg query_pooling
     document_pooling: !cfg document_pooling
     multi_ctx_training: !cfg multi_ctx_training
-    lambda_seq: 0.5
+    lambda_seq: 0.1
     # Keep the device batch (and therefore in-batch negatives) intact while
     # encoding each side in smaller forwards to reduce attention memory.
     query_micro_batch_size: 8

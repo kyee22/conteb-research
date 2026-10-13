@@ -318,7 +318,12 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                             groups[row, end] = group
                 qg, kg = groups[:, :, None], groups[:, None, :]
                 visible = visible & ((qg == kg) | (kg < qg))
-            additive = torch.zeros((bsz, 1, length, length), dtype=torch.float32, device=ref.device)
+            # additive = torch.zeros((bsz, 1, length, length), dtype=torch.float32, device=ref.device)
+            additive = torch.zeros(
+                (bsz, 1, length, length),
+                dtype=next(module.parameters()).dtype,
+                device=ref.device,
+            )
             kwargs["attention_mask"] = additive.masked_fill(
                 ~visible[:, None, :, :], torch.finfo(additive.dtype).min
             )
