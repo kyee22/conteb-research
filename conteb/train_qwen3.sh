@@ -8,7 +8,7 @@ mkdir -p "$LOG_DIR"
 
 # 关键：没匹配到时展开为空数组，而不是原样字符串
 setopt null_glob
-files=("$CONFIG_DIR"/qwen3*.yaml)
+files=("$CONFIG_DIR"/qwen3_base*.yaml)
 
 if (( ${#files} == 0 )); then
     echo "没找到 qwen3*.yaml"
