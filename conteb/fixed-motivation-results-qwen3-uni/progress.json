@@ -1,0 +1,12 @@
+{
+  "completed_datasets": [
+    "geography",
+    "covid-qa",
+    "insurance",
+    "football",
+    "squad-conteb-eval",
+    "narrative-qa",
+    "mldr-conteb-eval"
+  ],
+  "seed": 20261008
+}

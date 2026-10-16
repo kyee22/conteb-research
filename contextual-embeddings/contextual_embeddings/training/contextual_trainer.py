@@ -45,6 +45,8 @@ class ContextualTrainer(SentenceTransformerTrainer):
             add_prefixes=inputs.get("add_prefixes", False),
         )
         loss = model_outputs["loss"]
+        if "diversity_loss" in model_outputs:
+            self.log({"diversity_loss": model_outputs["diversity_loss"].item()})
 
         if return_outputs:
             # During prediction/evaluation, `compute_loss` will be called with `return_outputs=True`.

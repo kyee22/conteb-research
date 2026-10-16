@@ -38,7 +38,10 @@ from cde_benchmark.embedders.sitemb_embedder import (
     SitEmbChunkOnlyEmbedder,
     SitEmbContextualEmbedder,
 )
-from cde_benchmark.embedders.qwen3_late_chunking_embedder import Qwen3LateChunkingEmbedder
+from cde_benchmark.embedders.qwen3_late_chunking_embedder import (
+    Qwen3BOTEmbedder,
+    Qwen3LateChunkingEmbedder,
+)
 from cde_benchmark.embedders.voyage_contextual_embedder import VoyageContextualEmbedder
 from cde_benchmark.evaluators.longembed import LongEmbedEvaluator
 from cde_benchmark.evaluators.nanobeir import NanoBEIR
@@ -111,6 +114,8 @@ def get_model(
         )
     if model_type in {"qwen3_late", "qwen3_late_chunking"}:
         return Qwen3LateChunkingEmbedder.from_checkpoint(model_path, device=DEVICE)
+    if model_type in {"qwen3_bot", "qwen3_bot_late", "qwen3_bot_late_chunking"}:
+        return Qwen3BOTEmbedder.from_checkpoint(model_path, device=DEVICE)
 
     if model_type == 'voyage':
         return VoyageContextualEmbedder(

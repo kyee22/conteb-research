@@ -1,5 +1,5 @@
 from .collators import ContextualDataCollator
-from .models import LongContextEmbeddingModel, HyperContextEmbeddingModel, FlexLongContextEmbeddingModel, Qwen3LateChunkingModel
+from .models import LongContextEmbeddingModel, HyperContextEmbeddingModel, FlexLongContextEmbeddingModel, Qwen3LateChunkingModel, Qwen3BOTModel
 from .training import ContextualTrainer, ContextualTraining, ContextualTrainingConfig
 
 __all__ = [
@@ -7,6 +7,7 @@ __all__ = [
     "HyperContextEmbeddingModel",
     "FlexLongContextEmbeddingModel",
     "Qwen3LateChunkingModel",
+    "Qwen3BOTModel",
     "ContextualTraining",
     "ContextualTrainingConfig",
 ]

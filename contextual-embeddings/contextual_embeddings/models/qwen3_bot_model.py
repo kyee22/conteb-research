@@ -99,18 +99,21 @@ def build_attention_visibility(mode, valid, offsets=None, num_bot_tokens=0):
     """Return a bool tensor ``(batch, length, length)``; True means row may attend to column.
 
     Args:
-        mode: ``"bidirectional"``, ``"chunk_bidirectional_causal"`` or
-            ``"bottleneck_chunk"``.
+        mode: ``"bidirectional"``, ``"chunk_bidirectional_causal"``,
+            ``"bottleneck_chunk_bidirectional"`` or
+            ``"bottleneck_chunk_causal"``.
         valid: ``(batch, length)`` mask, 1 for real tokens and 0 for padding.
         offsets: Per-document list of ``(start, end)`` chunk spans in sequence
             coordinates (BOT prefix already included in the coordinates).
         num_bot_tokens: Number of BOT positions at the start of each row.
 
-    ``bottleneck_chunk`` rules (rows = query token, columns = key token):
+    ``bottleneck_chunk_bidirectional`` rules (rows = query token, columns = key token):
         * BOT row   -> every valid token (BOT and all chunks).
         * chunk row -> all BOT tokens and the tokens of its own chunk
           (content + terminal), bidirectionally.
         * chunk row -> never another chunk.
+    ``bottleneck_chunk_causal`` uses the same BOC rules, but a chunk row only
+    sees tokens at or before its position within its own chunk.
     """
     valid = valid.bool()
     batch_size, length = valid.shape
@@ -121,9 +124,14 @@ def build_attention_visibility(mode, valid, offsets=None, num_bot_tokens=0):
     qg, kg = groups[:, :, None], groups[:, None, :]
     if mode == "chunk_bidirectional_causal":
         return pair_valid & ((qg == kg) | (kg < qg))
-    if mode == "bottleneck_chunk":
+    if mode == "bottleneck_chunk_bidirectional":
         is_bot = torch.arange(length, device=valid.device) < num_bot_tokens
         return pair_valid & (is_bot[None, :, None] | is_bot[None, None, :] | (qg == kg))
+    if mode == "bottleneck_chunk_causal":
+        positions = torch.arange(length, device=valid.device)
+        is_bot = positions < num_bot_tokens
+        causal_within_chunk = (qg == kg) & (positions[None, None, :] <= positions[None, :, None])
+        return pair_valid & (is_bot[None, :, None] | is_bot[None, None, :] | causal_within_chunk)
     raise ValueError(f"Unsupported attention mode for a custom mask: {mode}")
 
 
@@ -136,14 +144,14 @@ class Qwen3LateChunkingModel(SentenceTransformer):
     configurable per-chunk document pooling. It does not infer chunk boundaries
     from ``sep_token``, ``eos_token_id``, or ``pad_token_id``.
 
-    With ``attention_mode="bottleneck_chunk"`` every document row is
+    With ``attention_mode="bottleneck_chunk_bidirectional"`` every document row is
     ``[BOT_1..BOT_K] content(c1) T content(c2) T ...``. The BOT tokens read the
     whole document, each chunk reads only the BOT tokens and itself, so chunk
     vectors receive document context exclusively through the BOT tokens.
     Queries are never affected: they keep the native causal mask and
     last-token pooling of Qwen3-Embedding.
     """
-    VALID_ATTENTION = {"causal", "bidirectional", "chunk_bidirectional_causal", "bottleneck_chunk"}
+    VALID_ATTENTION = {"causal", "bidirectional", "chunk_bidirectional_causal", "bottleneck_chunk_bidirectional", "bottleneck_chunk_causal"}
     VALID_QUERY_POOLING = {"last_token", "mean"}
     VALID_DOCUMENT_POOLING = {"late_chunking_mean", "late_chunking_last_token"}
 
@@ -170,7 +178,8 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 ``"bidirectional"`` for all valid tokens to attend to one
                 another, ``"chunk_bidirectional_causal"`` for bidirectional
                 attention within a document chunk and visibility to earlier
-                chunks only, or ``"bottleneck_chunk"`` for K prepended BOT
+                chunks only, or ``"bottleneck_chunk_bidirectional"`` for K
+                prepended BOT
                 tokens that see the whole document while every chunk sees only
                 the BOT tokens and itself. Query forwards remain causal in both
                 chunk-aware modes because queries have no document chunk
@@ -192,7 +201,8 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 per forward. Each document remains intact, so its chunks keep
                 their full contextual attention.
             num_bot_tokens: Number K of BOT tokens prepended to every document.
-                Only valid with ``attention_mode="bottleneck_chunk"``, where
+                Only valid with
+                ``attention_mode="bottleneck_chunk_bidirectional"``, where
                 ``None`` means ``DEFAULT_NUM_BOT_TOKENS``. The tokens
                 ``<|bot_0|> ... <|bot_{K-1}|>`` are added to the tokenizer
                 (if missing) and their embedding rows are initialised according
@@ -220,6 +230,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 document_pooling = meta.get("document_pooling", document_pooling)
                 query_template = meta.get("query_template", query_template)
                 num_bot_tokens = meta.get("num_bot_tokens", num_bot_tokens)
+                bot_init = meta.get("bot_init", bot_init)
+                bot_init_token = meta.get("bot_init_token", bot_init_token)
+                bot_init_noise = meta.get("bot_init_noise", bot_init_noise)
+                bot_init_seed = meta.get("bot_init_seed", bot_init_seed)
+                kwargs["lambda_div"] = meta.get("lambda_div", kwargs.get("lambda_div", 0.0))
             base_model = SentenceTransformer(str(checkpoint), trust_remote_code=True)
         if attention_mode not in self.VALID_ATTENTION:
             raise ValueError(f"attention_mode must be one of {sorted(self.VALID_ATTENTION)}")
@@ -227,13 +242,13 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             raise ValueError(f"query_pooling must be one of {sorted(self.VALID_QUERY_POOLING)}")
         if document_pooling not in self.VALID_DOCUMENT_POOLING:
             raise ValueError(f"document_pooling must be one of {sorted(self.VALID_DOCUMENT_POOLING)}")
-        if attention_mode == "bottleneck_chunk":
+        if attention_mode in {"bottleneck_chunk_bidirectional", "bottleneck_chunk_causal"}:
             num_bot_tokens = DEFAULT_NUM_BOT_TOKENS if num_bot_tokens is None else int(num_bot_tokens)
             if num_bot_tokens < 1:
-                raise ValueError("attention_mode='bottleneck_chunk' requires num_bot_tokens >= 1")
+                raise ValueError("attention_mode='bottleneck_chunk_bidirectional' requires num_bot_tokens >= 1")
         else:
             if num_bot_tokens:
-                raise ValueError("num_bot_tokens is only supported with attention_mode='bottleneck_chunk'")
+                raise ValueError("num_bot_tokens is only supported with attention_mode='bottleneck_chunk_bidirectional'")
             num_bot_tokens = 0
         if bot_init not in VALID_BOT_INIT:
             raise ValueError(f"bot_init must be one of {sorted(VALID_BOT_INIT)}")
@@ -258,6 +273,10 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         self.sim_score_scale = kwargs.pop("sim_score_scale", 20.0)
         self.multi_ctx_training = kwargs.pop("multi_ctx_training", True)
         self.lambda_seq = kwargs.pop("lambda_seq", 0.5)
+        self.lambda_div = float(kwargs.pop("lambda_div", 0.0))
+        if self.lambda_div < 0:
+            raise ValueError("lambda_div must be >= 0")
+        print(f"Qwen3LateChunkingModel: lambda_div={self.lambda_div}")
         self.show_progress_bar = kwargs.pop("show_progress_bar", True)
         self.batch_size = kwargs.pop("batch_size", 16)
         self.query_micro_batch_size = self._validate_micro_batch_size(
@@ -388,10 +407,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
     @staticmethod
     def _pad_chunk_outputs(outputs):
         """Restore a common chunk dimension after document micro-batching."""
-        max_chunks = max((pooled.shape[1] for pooled, _ in outputs), default=0)
+        max_chunks = max((pooled.shape[1] for pooled, _, _ in outputs), default=0)
         padded_embeddings = []
         padded_masks = []
-        for pooled, padding in outputs:
+        padded_boc = []
+        for pooled, padding, boc in outputs:
             missing = max_chunks - pooled.shape[1]
             if missing:
                 pooled = F.pad(pooled, (0, 0, 0, missing))
@@ -401,9 +421,10 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 )
             padded_embeddings.append(pooled)
             padded_masks.append(padding)
+            padded_boc.append(boc)
         if not padded_embeddings:
-            return None, None
-        return torch.cat(padded_embeddings, dim=0), torch.cat(padded_masks, dim=0)
+            return None, None, None
+        return torch.cat(padded_embeddings, dim=0), torch.cat(padded_masks, dim=0), torch.cat(padded_boc, dim=0)
 
     def tokenize(self, texts, **kwargs):
         """Tokenize texts using the wrapped SentenceTransformer.
@@ -500,7 +521,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         * ``bidirectional``: every valid token pair is visible.
         * ``chunk_bidirectional_causal``: a token sees its own chunk and
           earlier chunks, never later ones.
-        * ``bottleneck_chunk``: BOT rows see every valid token; chunk rows see
+        * ``bottleneck_chunk_bidirectional``: BOT rows see every valid token; chunk rows see
           the BOT tokens and their own chunk only.
 
         The explicit terminal token belongs to the chunk it terminates, so the
@@ -526,7 +547,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             if ref is None or valid is None or valid.ndim != 2:
                 return args, kwargs
             offsets = getattr(self, "_active_chunk_offsets", None)
-            if self.attention_mode in {"chunk_bidirectional_causal", "bottleneck_chunk"} and not offsets:
+            if self.attention_mode in {"chunk_bidirectional_causal", "bottleneck_chunk_bidirectional", "bottleneck_chunk_causal"} and not offsets:
                 # Query sequences have no document chunk offsets. Keep their
                 # normal causal mask; the chunk-aware mask is document-only.
                 return args, kwargs
@@ -645,7 +666,8 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             self._active_chunk_offsets = offsets[start:end]
             try:
                 hidden = self.base_model(micro_inputs)["token_embeddings"]
-                outputs.append(self._pool_documents(hidden, offsets[start:end]))
+                pooled, padding = self._pool_documents(hidden, offsets[start:end])
+                outputs.append((pooled, padding, hidden[:, :self.num_bot_tokens]))
             finally:
                 self._active_chunk_offsets = None
         return self._pad_chunk_outputs(outputs)
@@ -664,6 +686,21 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             dimension. The caller applies the configured logit scale.
         """
         return F.normalize(a, dim=-1) @ F.normalize(b, dim=-1).transpose(-2, -1)
+
+    def _compute_diversity(self, boc):
+        """Return scalar mean off-diagonal cosine similarity across documents.
+
+        ``boc`` is shaped ``(batch_size, num_bot_tokens, hidden_size)``. The
+        batch reduction is intentional: the trainer logs this value with
+        ``Tensor.item()`` and the same scalar is added to the batch loss.
+        """
+        if self.num_bot_tokens < 2 or boc.numel() == 0:
+            return boc.sum() * 0.0
+        normalized = F.normalize(boc, dim=-1)
+        similarity = normalized @ normalized.transpose(-1, -2)
+        k = self.num_bot_tokens
+        per_document = (similarity.sum(dim=(-1, -2)) - k) / (k * (k - 1))
+        return per_document.mean()
 
     def _compute_loss(self, queries, chunks, padding, indices, n_docs_per_sample=None):
         """Compute contrastive loss over flattened valid document chunks.
@@ -785,9 +822,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 ``ContextualTrainer``; the model reads batch metadata directly.
 
         Returns:
-            ``{"loss": scalar_tensor}``. Query states are pooled independently,
-            document states are pooled from explicit offsets, and no BOT,
-            separator or right-padding token is included in a document embedding.
+            A dictionary with ``loss`` as a scalar (0-D) tensor and
+            ``diversity_loss`` as a detached scalar (0-D) tensor. Query states
+            are pooled independently, document states are pooled from explicit
+            offsets, and no BOT, separator or right-padding token is included
+            in a document embedding.
         """
         batch = args[0]
         try:
@@ -795,7 +834,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             # only installed for the document forward below.
             self._active_chunk_offsets = None
             queries = self._encode_queries_microbatched(batch["query_inputs"])
-            chunks, padding = self._encode_documents_microbatched(
+            chunks, padding, boc = self._encode_documents_microbatched(
                 batch["docs_inputs"], batch["chunk_offsets"]
             )
             loss_type = kwargs.get("loss_type", "weighted")
@@ -812,7 +851,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 )
             else:
                 raise ValueError("Unknown loss_type. Supported values: weighted, inbatch_inseq, late_interaction")
-            return {"loss": loss}
+            diversity = self._compute_diversity(boc)
+            return {
+                "loss": loss + self.lambda_div * diversity,
+                "diversity_loss": diversity.detach(),
+            }
         finally:
             self._active_chunk_offsets = None
 
@@ -914,6 +957,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             "attention_mode": self.attention_mode, "query_pooling": self.query_pooling,
             "document_pooling": self.document_pooling, "query_template": self.query_template,
             "num_bot_tokens": self.num_bot_tokens,
+            "lambda_div": self.lambda_div,
             # Provenance only: the trained rows are stored in the weights, so
             # loading never re-initialises them.
             "bot_init": self.bot_init, "bot_init_token": self.bot_init_token,
@@ -935,3 +979,8 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             behavior matches the saved training configuration.
         """
         return cls(path, **kwargs)
+
+
+# Keep the implementation name compatible with the file's original draft while
+# exposing an explicit public name for config files and downstream callers.
+Qwen3BOTModel = Qwen3LateChunkingModel

@@ -17,7 +17,6 @@ The model type names and model construction are the same as eval_conteb.py.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import random
 import sys
@@ -237,9 +236,15 @@ def _plot_similarity_histograms(dataset_values: dict[str, dict[str, list[float]]
     colors = {"embedder1": "#7895B2", "embedder2": "#C58B8B"}
     labels = {"embedder1": "independent", "embedder2": "contextual"}
     for axis, dataset in zip(axes[: len(DATASETS)], DATASETS, strict=True):
+        values = [
+            value
+            for key in ("embedder1", "embedder2")
+            for value in dataset_values[dataset][key]
+        ]
+        bin_edges = np.histogram_bin_edges(values, bins=20)
         for key in ("embedder1", "embedder2"):
             sns.histplot(
-                dataset_values[dataset][key], bins=20, stat="count", element="step",
+                dataset_values[dataset][key], bins=bin_edges, stat="count", element="step",
                 fill=True, alpha=0.38, color=colors[key], label=labels[key], ax=axis,
             )
         axis.set_title(dataset, fontsize=15)
@@ -345,8 +350,6 @@ def run(args: argparse.Namespace) -> None:
     np.random.seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = Path(args.cache_dir) if args.cache_dir else output_dir / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
     embedder1 = get_model(args.embedder1_model, False, args.embedder1_type, args.use_prefix, args.extend_context)
     embedder2 = get_model(args.embedder2_model, False, args.embedder2_type, args.use_prefix, args.extend_context)
     similarities: dict[str, dict[str, list[float]]] = {}
@@ -357,18 +360,7 @@ def run(args: argparse.Namespace) -> None:
         dataset_values: dict[str, list[float]] = {}
         dataset_errors: dict[str, list[tuple[int, int]]] = {}
         for key, embedder in (("embedder1", embedder1), ("embedder2", embedder2)):
-            model_key = hashlib.sha1(
-                f"{key}|{getattr(args, key + '_model')}|{getattr(args, key + '_type')}|{args.use_prefix}".encode()
-            ).hexdigest()[:12]
-            cache_path = cache_dir / f"{dataset}_{model_key}.pt"
-            if cache_path.exists():
-                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                queries, gold_ids, chunks, chunk_ids = payload
-                print(f"Loaded cache: {cache_path}")
-            else:
-                queries, gold_ids, chunks, chunk_ids = _embed_dataset(formatter, embedder)
-                torch.save((queries, gold_ids, chunks, chunk_ids), cache_path)
-                print(f"Saved cache: {cache_path}")
+            queries, gold_ids, chunks, chunk_ids = _embed_dataset(formatter, embedder)
             dataset_values[key] = _internal_similarity_values(chunks, chunk_ids)
             dataset_errors[key] = _ranking_errors(queries, gold_ids, chunks, chunk_ids)
         similarities[dataset] = dataset_values
@@ -402,8 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedder2-type", required=True)
     parser.add_argument("--data-base-path", default="illuin-conteb")
     parser.add_argument("--output-dir", default="conteb/motivation-results")
-    parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--sample-queries", type=int, default=40)
+    parser.add_argument(
+        "--sample-queries", type=int, default=40
+    )
     parser.add_argument("--seed", type=int, default=20261008)
     parser.add_argument("--use-prefix", action="store_true")
     parser.add_argument("--extend-context", action="store_true")

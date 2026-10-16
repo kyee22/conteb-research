@@ -318,17 +318,21 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                             groups[row, end] = group
                 qg, kg = groups[:, :, None], groups[:, None, :]
                 visible = visible & ((qg == kg) | (kg < qg))
-            # additive = torch.zeros((bsz, 1, length, length), dtype=torch.float32, device=ref.device)
-            additive = torch.zeros(
-                (bsz, 1, length, length),
-                dtype=next(module.parameters()).dtype,
-                device=ref.device,
-            )
+            dtype = self._attention_mask_dtype(module, ref.device)
+            additive = torch.zeros((bsz, 1, length, length), dtype=dtype, device=ref.device)
             kwargs["attention_mask"] = additive.masked_fill(
-                ~visible[:, None, :, :], torch.finfo(additive.dtype).min
+                ~visible[:, None, :, :], torch.finfo(dtype).min
             )
             return args, kwargs
         self.base_model[0].auto_model._qwen3_late_hook = self.base_model[0].auto_model.register_forward_pre_hook(hook, with_kwargs=True)
+
+    @staticmethod
+    def _attention_mask_dtype(module, device):
+        """Return the additive-mask dtype expected by Qwen3 attention."""
+        if device.type == "cuda" and torch.is_autocast_enabled():
+            getter = getattr(torch, "get_autocast_dtype", None)
+            return getter("cuda") if getter else torch.get_autocast_gpu_dtype()
+        return module.get_input_embeddings().weight.dtype
 
     def _pool_queries(self, inputs):
         """Pool query token states according to ``query_pooling``.

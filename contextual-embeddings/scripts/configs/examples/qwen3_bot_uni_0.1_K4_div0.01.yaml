@@ -1,0 +1,87 @@
+multi_ctx_training: True
+attention_mode: "bottleneck_chunk_causal"      # BOC document mask; queries remain causal
+query_pooling: "last_token"             # {"last_token", "mean"}
+document_pooling: "late_chunking_mean"  # {"late_chunking_mean", "late_chunking_last_token"}
+num_bot_tokens: 4                         # K, the number of learnable BOC tokens
+bot_init: "token"                    # {"mean_noise", "random_normal", "sampled_tokens", "token"}
+bot_init_token: "<|endoftext|>"
+bot_init_noise: 0.1
+bot_init_seed: 0
+base_model:
+  (): sentence_transformers.SentenceTransformer
+  model_name_or_path: "Qwen/Qwen3-Embedding-0.6B"
+  model_kwargs:
+    attn_implementation: "sdpa"
+    torch_dtype: !ext torch.bfloat16
+  # tokenizer_kwargs:
+  #   padding_side: "left"
+
+config:
+  (): contextual_embeddings.ContextualTrainingConfig
+  add_prefixes: False
+
+  model:
+    (): contextual_embeddings.Qwen3BOTModel
+    base_model: !cfg base_model
+    attention_mode: !cfg attention_mode
+    query_pooling: !cfg query_pooling
+    document_pooling: !cfg document_pooling
+    num_bot_tokens: !cfg num_bot_tokens
+    bot_init: !cfg bot_init
+    bot_init_token: !cfg bot_init_token
+    bot_init_noise: !cfg bot_init_noise
+    bot_init_seed: !cfg bot_init_seed
+    multi_ctx_training: !cfg multi_ctx_training
+    lambda_seq: 0.1
+    lambda_div: 0.01
+    # Keep the device batch (and therefore in-batch negatives) intact while
+    # encoding each side in smaller forwards to reduce attention memory.
+    query_micro_batch_size: 8
+    document_micro_batch_size: 1
+  multi_ctx_training: !cfg multi_ctx_training
+  loss_type: "weighted"
+  exp_name: "qwen3-embedding-0.6b-boc"
+  n_gpus: 2
+  output_dir: "./checkpoints/qwen3-embedding-0.6b"
+  train_dataset:
+    (): contextual_embeddings.models.utils.get_long_context_dataset
+    base_model: !cfg base_model
+  eval_dataset:
+    mldr:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/mldr-conteb-train"
+      split: "test"
+      base_model: !cfg base_model
+    squad:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/squad-conteb-train"
+      split: "validation"
+      base_model: !cfg base_model
+      all_queries: False
+    narrative_qa:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/narrative-qa"
+      split: "test"
+      base_model: !cfg base_model
+      all_queries: False
+  run_train: True
+  training_args:
+    (): sentence_transformers.SentenceTransformerTrainingArguments
+    output_dir: null
+    num_train_epochs: 2
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    fp16: False
+    bf16: True
+    gradient_checkpointing: True
+    gradient_checkpointing_kwargs:
+      use_reentrant: False
+    ddp_find_unused_parameters: False
+    learning_rate: 5e-5
+    warmup_ratio: 0.05
+    lr_scheduler_type: "cosine"
+    eval_strategy: "steps"
+    eval_on_start: True
+    eval_steps: 100
+    logging_steps: 10
+    report_to: "wandb"
