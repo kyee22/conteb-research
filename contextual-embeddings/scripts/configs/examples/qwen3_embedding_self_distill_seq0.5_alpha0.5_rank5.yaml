@@ -1,0 +1,86 @@
+multi_ctx_training: True
+attention_mode: "causal"                # {"causal", "bidirectional", "chunk_bidirectional_causal"}
+query_pooling: "last_token"             # {"last_token", "mean"}
+document_pooling: "late_chunking_mean"  # {"late_chunking_mean", "late_chunking_last_token"}
+base_model:
+  (): sentence_transformers.SentenceTransformer
+  model_name_or_path: "Qwen/Qwen3-Embedding-0.6B"
+  model_kwargs:
+    attn_implementation: "sdpa"
+    torch_dtype: !ext torch.bfloat16
+  # tokenizer_kwargs:
+  #   padding_side: "left"
+
+config:
+  (): contextual_embeddings.ContextualTrainingConfig
+  add_prefixes: False
+
+  model:
+    (): contextual_embeddings.Qwen3LateChunkingModel
+    base_model: !cfg base_model
+    attention_mode: !cfg attention_mode
+    query_pooling: !cfg query_pooling
+    document_pooling: !cfg document_pooling
+    multi_ctx_training: !cfg multi_ctx_training
+    lambda_seq: 0.5
+    # Training-only self-distillation.  The teacher is a frozen copy of the
+    # initial encoder; inference never runs the teacher branch.
+    self_distillation: True
+    # Enable soft labels only when the frozen teacher ranks the gold chunk in
+    # its top-k: 1 <= rank_teacher(gold) <= self_distillation_rank_k.
+    self_distillation_rank_k: 5
+    # For a gated query, teacher chunk j receives the unnormalized weight
+    # alpha * min(1, exp((s_teacher[j]-s_teacher[gold]) * sim_score_scale));
+    # weights are normalized across that document's valid chunks.
+    self_distillation_alpha: 0.5
+    # Keep the device batch (and therefore in-batch negatives) intact while
+    # encoding each side in smaller forwards to reduce attention memory.
+    query_micro_batch_size: 8
+    document_micro_batch_size: 1
+  multi_ctx_training: !cfg multi_ctx_training
+  loss_type: "weighted"
+  exp_name: "qwen3-embedding-0.6b-late-chunking-self-distill"
+  n_gpus: 4
+  output_dir: "./checkpoints/qwen3-embedding-0.6b"
+  train_dataset:
+    (): contextual_embeddings.models.utils.get_long_context_dataset
+    base_model: !cfg base_model
+  eval_dataset:
+    mldr:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/mldr-conteb-train"
+      split: "test"
+      base_model: !cfg base_model
+    squad:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/squad-conteb-train"
+      split: "validation"
+      base_model: !cfg base_model
+      all_queries: False
+    narrative_qa:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/narrative-qa"
+      split: "test"
+      base_model: !cfg base_model
+      all_queries: False
+  run_train: True
+  training_args:
+    (): sentence_transformers.SentenceTransformerTrainingArguments
+    output_dir: null
+    num_train_epochs: 2
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    fp16: False
+    bf16: True
+    gradient_checkpointing: True
+    gradient_checkpointing_kwargs:
+      use_reentrant: False
+    ddp_find_unused_parameters: False
+    learning_rate: 5e-5
+    warmup_ratio: 0.05
+    lr_scheduler_type: "cosine"
+    eval_strategy: "steps"
+    eval_on_start: True
+    eval_steps: 100
+    logging_steps: 10
+    report_to: "wandb"

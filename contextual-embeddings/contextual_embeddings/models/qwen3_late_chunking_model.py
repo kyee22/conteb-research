@@ -1,6 +1,7 @@
 """Configurable Qwen3 contextual embeddings with explicit chunk offsets."""
 
 import json
+import copy
 from pathlib import Path
 
 import torch
@@ -101,7 +102,19 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         self.sim_score_scale = kwargs.pop("sim_score_scale", 20.0)
         self.multi_ctx_training = kwargs.pop("multi_ctx_training", True)
         self.lambda_seq = kwargs.pop("lambda_seq", 0.5)
+        self.self_distillation = kwargs.pop("self_distillation", False)
+        self.self_distillation_rank_k = kwargs.pop("self_distillation_rank_k", 2)
+        self.self_distillation_alpha = kwargs.pop("self_distillation_alpha", 0.5)
+        if self.self_distillation_rank_k < 1:
+            raise ValueError("self_distillation_rank_k must be >= 1")
+        if not 0.0 <= self.self_distillation_alpha <= 1.0:
+            raise ValueError("self_distillation_alpha must be in [0, 1]")
         print(f"Qwen3LateChunkingModel: lambda_seq={self.lambda_seq}")
+        print(
+            "Qwen3LateChunkingModel: self_distillation="
+            f"{self.self_distillation}, rank_k={self.self_distillation_rank_k}, "
+            f"alpha={self.self_distillation_alpha}"
+        )
         self.show_progress_bar = kwargs.pop("show_progress_bar", True)
         self.batch_size = kwargs.pop("batch_size", 16)
         self.query_micro_batch_size = self._validate_micro_batch_size(
@@ -112,10 +125,28 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         )
         self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
         self.terminal_token_id = self.base_model.tokenizer.pad_token_id
+        # Keep a permanent snapshot only when the intervention is enabled. In
+        # the default-disabled path this preserves the original memory use and
+        # model structure exactly.
+        self.teacher_base_model = None
+        if self.self_distillation:
+            # This is a genuine teacher copy: it is never optimized and is
+            # forced back to eval mode even when the outer student enters train.
+            self.teacher_base_model = copy.deepcopy(self.base_model)
+            for parameter in self.teacher_base_model.parameters():
+                parameter.requires_grad_(False)
+            self.teacher_base_model.eval()
         # Dataset construction only needs a reversible textual placeholder;
         # actual Qwen3 chunk boundaries come from offsets later.
         self.dataset_separator = self.base_model.tokenizer.pad_token or "<|endoftext|>"
         self._install_attention_hook()
+
+    def train(self, mode=True):
+        """Set student mode while keeping the frozen teacher in eval mode."""
+        super().train(mode)
+        if self.teacher_base_model is not None:
+            self.teacher_base_model.eval()
+        return self
 
     @staticmethod
     def _validate_micro_batch_size(value, name):
@@ -348,7 +379,11 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             is one and divides by the valid-token count.
             An all-zero mask is clamped to one to avoid division by zero.
         """
-        hidden = self.base_model(inputs)["token_embeddings"]
+        return self._pool_query_inputs(self.base_model, inputs)
+
+    def _pool_query_inputs(self, encoder, inputs):
+        """Pool query inputs with either the student or frozen teacher encoder."""
+        hidden = encoder(inputs)["token_embeddings"]
         mask = inputs["attention_mask"].bool()
         if self.query_pooling == "last_token":
             positions = torch.arange(mask.shape[1], device=mask.device).expand(mask.shape[0], -1)
@@ -443,6 +478,85 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 self._active_chunk_offsets = None
         return self._pad_chunk_outputs(outputs)
 
+    def _encode_teacher_queries(self, inputs):
+        """Encode queries with the frozen teacher for teacher-only scores."""
+        reference = inputs.get("input_ids", inputs.get("attention_mask"))
+        if reference is None:
+            raise ValueError("query inputs must contain input_ids or attention_mask")
+        batch_size = reference.shape[0]
+        micro = self.query_micro_batch_size or batch_size
+        outputs = []
+        padding_side = getattr(self.teacher_base_model.tokenizer, "padding_side", "right")
+        with torch.no_grad():
+            for start in range(0, batch_size, micro):
+                end = min(start + micro, batch_size)
+                micro_inputs = self._slice_inputs(inputs, start, end, batch_size)
+                micro_inputs = self._trim_micro_inputs(micro_inputs, padding_side)
+                outputs.append(self._pool_query_inputs(self.teacher_base_model, micro_inputs))
+        return torch.cat(outputs, dim=0)
+
+    def _encode_teacher_chunks(self, inputs, chunk_counts):
+        """Encode each chunk independently with the frozen teacher.
+
+        ``inputs`` is flat with shape ``(sum(chunk_counts), T)``.  Each row is
+        one chunk and therefore has no document offsets.  The returned tensor
+        is padded to ``(B, max_chunks, H)`` and accompanied by a boolean mask
+        of shape ``(B, max_chunks)``.  Mean pooling uses all valid tokens;
+        last-token pooling uses the final valid tokenizer position, matching
+        the student's configured document pooling without adding separators.
+        """
+        if inputs is None or chunk_counts is None:
+            raise ValueError("teacher inputs and teacher_chunk_counts are required")
+        reference = inputs.get("input_ids", inputs.get("attention_mask"))
+        if reference is None:
+            raise ValueError("teacher document inputs must contain input_ids or attention_mask")
+        total = reference.shape[0]
+        if total != sum(chunk_counts):
+            raise ValueError("teacher input rows do not match teacher_chunk_counts")
+        micro = self.document_micro_batch_size or total
+        padding_side = getattr(self.teacher_base_model.tokenizer, "padding_side", "right")
+        flat_outputs = []
+        with torch.no_grad():
+            for start in range(0, total, micro):
+                end = min(start + micro, total)
+                micro_inputs = self._slice_inputs(inputs, start, end, total)
+                micro_inputs = self._trim_micro_inputs(micro_inputs, padding_side)
+                hidden = self.teacher_base_model(micro_inputs)["token_embeddings"]
+                mask = micro_inputs["attention_mask"].bool()
+                if self.document_pooling == "late_chunking_last_token":
+                    positions = torch.arange(mask.shape[1], device=mask.device).expand(mask.shape[0], -1)
+                    pos = positions.masked_fill(~mask, -1).max(dim=1).values.clamp_min(0)
+                    pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), pos]
+                else:
+                    pooled = (hidden * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp_min(1)
+                flat_outputs.append(pooled)
+        flat = torch.cat(flat_outputs, dim=0) if flat_outputs else reference.new_empty((0, 0))
+        if self.normalize_embeddings:
+            flat = F.normalize(flat, dim=-1)
+        max_chunks = max(chunk_counts, default=0)
+        result = flat.new_zeros((len(chunk_counts), max_chunks, flat.shape[-1]))
+        padding = torch.ones((len(chunk_counts), max_chunks), dtype=torch.bool, device=flat.device)
+        cursor = 0
+        for row, count in enumerate(chunk_counts):
+            if count:
+                result[row, :count] = flat[cursor:cursor + count]
+                padding[row, :count] = False
+                cursor += count
+        return result, padding
+
+    @staticmethod
+    def _validate_teacher_layout(chunk_offsets, teacher_chunk_counts):
+        """Ensure teacher rows use the same document/chunk layout as student."""
+        if chunk_offsets is None or teacher_chunk_counts is None:
+            raise ValueError("chunk_offsets and teacher_chunk_counts are required")
+        student_counts = [len(offsets) for offsets in chunk_offsets]
+        teacher_counts = [int(count) for count in teacher_chunk_counts]
+        if student_counts != teacher_counts:
+            raise ValueError(
+                "Teacher/student chunk layout mismatch: "
+                f"student counts={student_counts}, teacher counts={teacher_counts}"
+            )
+
     def _compute_sim(self, a, b):
         """Compute normalized pairwise cosine similarities.
 
@@ -485,7 +599,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             labels = torch.cat([torch.tensor(ix, device=scores.device) + offsets[i] for i, ix in enumerate(indices)])
         return self.cross_entropy_loss(scores, labels)
 
-    def _compute_loss_from_embeddings(self, queries, documents, labels):
+    def _compute_loss_from_embeddings(self, queries, documents, labels, targets=None):
         """Compute in-sequence cross-entropy for one sample's documents.
 
         ``queries`` has shape ``(n_queries, hidden_size)`` and ``documents``
@@ -494,7 +608,48 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         by ModernBERT's weighted loss.
         """
         scores = self._compute_sim(queries, documents) * self.sim_score_scale
-        return self.cross_entropy_loss(scores, labels)
+        if targets is None:
+            return self.cross_entropy_loss(scores, labels)
+        # Soft-label cross entropy has the same logits and temperature as the
+        # original CE; only the target distribution changes from one-hot to
+        # ``targets`` with shape ``(n_queries, n_documents)``.
+        return -(targets * F.log_softmax(scores, dim=-1)).sum(dim=-1).mean()
+
+    def _teacher_targets(self, teacher_queries, teacher_chunks, teacher_padding, indices):
+        """Build gated soft targets and return global query/gate counters.
+
+        For each sample, teacher logits are computed only over its valid chunks.
+        A query's gold rank is 1-based.  When it is within ``rank_k``, every
+        non-gold chunk receives ``alpha * min(1, exp(z_j-z_gold))``; otherwise
+        the row remains exactly one-hot.  All returned tensors are detached.
+        """
+        targets_per_sample = []
+        total_pairs = enabled_pairs = 0
+        query_offset = 0
+        for sample_idx, sample_indices in enumerate(indices):
+            valid = teacher_chunks[sample_idx][~teacher_padding[sample_idx]]
+            sample_queries = teacher_queries[query_offset:query_offset + len(sample_indices)]
+            query_offset += len(sample_indices)
+            logits = self._compute_sim(sample_queries, valid) * self.sim_score_scale
+            sample_targets = []
+            for row, gold in enumerate(sample_indices):
+                total_pairs += 1
+                order = torch.argsort(logits[row], descending=True)
+                rank = int((order == int(gold)).nonzero(as_tuple=False).item()) + 1
+                if rank <= self.self_distillation_rank_k:
+                    enabled_pairs += 1
+                    weights = torch.zeros_like(logits[row])
+                    gold_logit = logits[row, int(gold)]
+                    support = torch.exp((logits[row] - gold_logit).clamp_max(0.0))
+                    weights[:] = self.self_distillation_alpha * support
+                    weights[int(gold)] = 1.0
+                    sample_targets.append((weights / weights.sum()).detach())
+                else:
+                    one_hot = torch.zeros_like(logits[row])
+                    one_hot[int(gold)] = 1.0
+                    sample_targets.append(one_hot)
+            targets_per_sample.append(torch.stack(sample_targets) if sample_targets else logits.new_empty((0, valid.shape[0])))
+        return targets_per_sample, total_pairs, enabled_pairs
 
     def _compute_loss_batch_negatives(self, queries, batch_negatives, gold_documents):
         """Compute the in-batch-negative component for one training sample.
@@ -515,7 +670,7 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         labels = torch.zeros(queries.shape[0], dtype=torch.long, device=queries.device)
         return self.cross_entropy_loss(scores * self.sim_score_scale, labels)
 
-    def _compute_loss_inbatch_inseq(self, queries, chunks, padding, indices, n_docs_per_sample=None):
+    def _compute_loss_inbatch_inseq(self, queries, chunks, padding, indices, n_docs_per_sample=None, targets_per_sample=None):
         """Compute the parent's global in-batch/in-sequence objective.
 
         All valid chunks in the device batch become columns in one logits
@@ -540,9 +695,27 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 torch.tensor(sample_indices, device=queries.device) + offsets[sample_idx]
                 for sample_idx, sample_indices in enumerate(indices)
             ])
-        return self.cross_entropy_loss(scores, labels)
+        if targets_per_sample is None:
+            return self.cross_entropy_loss(scores, labels)
+        targets = torch.zeros_like(scores)
+        query_offset = 0
+        for sample_idx, sample_indices in enumerate(indices):
+            if self.multi_ctx_training:
+                base = sample_idx * chunks.shape[1]
+            else:
+                base = int(torch.tensor([0] + n_docs_per_sample[:-1]).cumsum(0)[sample_idx])
+            count = len(sample_indices)
+            targets[query_offset:query_offset + count, base:base + chunks.shape[1]] = F.pad(
+                targets_per_sample[sample_idx],
+                (0, chunks.shape[1] - targets_per_sample[sample_idx].shape[1]),
+            )
+            query_offset += count
+        log_probs = F.log_softmax(scores, dim=-1)
+        # Padding logits are -inf. Explicitly zero their contribution before
+        # multiplication because 0 * (-inf) is NaN in IEEE floating point.
+        return -(targets * log_probs).masked_fill(targets == 0, 0.0).sum(dim=-1).mean()
 
-    def _compute_loss_weighted(self, queries, chunks, padding, indices):
+    def _compute_loss_weighted(self, queries, chunks, padding, indices, targets_per_sample=None):
         """Compute ModernBERT's ``lambda_seq`` weighted objective.
 
         For each sample, the loss is ``lambda_seq * in_sequence_loss +
@@ -558,7 +731,8 @@ class Qwen3LateChunkingModel(SentenceTransformer):
             sample_queries = queries[query_offset:query_offset + len(sample_indices)]
             query_offset += len(sample_indices)
             labels = torch.tensor(sample_indices, dtype=torch.long, device=queries.device)
-            sequence_losses.append(self._compute_loss_from_embeddings(sample_queries, valid_docs, labels))
+            targets = None if targets_per_sample is None else targets_per_sample[sample_idx]
+            sequence_losses.append(self._compute_loss_from_embeddings(sample_queries, valid_docs, labels, targets))
             other = torch.arange(batch_size, device=chunks.device) != sample_idx
             batch_negatives = chunks[other][~padding[other]]
             batch_losses.append(self._compute_loss_batch_negatives(sample_queries, batch_negatives, valid_docs[labels]))
@@ -569,8 +743,10 @@ class Qwen3LateChunkingModel(SentenceTransformer):
 
         Args:
             args[0]: Dictionary containing ``query_inputs``, ``docs_inputs``,
-                ``chunk_offsets``, and ``queries_chunk_indices``. The optional
-                ``n_docs_per_sample`` is used for single-context labels.
+                ``chunk_offsets``, and ``queries_chunk_indices``. When training
+                self-distillation, it also contains flat ``teacher_docs_inputs``
+                with one row per chunk and ``teacher_chunk_counts``. The
+                optional ``n_docs_per_sample`` is used for single-context labels.
             **kwargs: Compatibility arguments accepted by
                 ``ContextualTrainer``; the model reads batch metadata directly.
 
@@ -589,11 +765,31 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 batch["docs_inputs"], batch["chunk_offsets"]
             )
             loss_type = kwargs.get("loss_type", "weighted")
+            targets_per_sample = None
+            self_distill_total = self_distill_enabled = None
+            # Distillation is deliberately training-only.  The teacher is a
+            # frozen initial-weight snapshot and receives the independently
+            # tokenized chunk rows supplied by the collator.
+            if self.training and self.self_distillation:
+                self._validate_teacher_layout(
+                    batch["chunk_offsets"], batch.get("teacher_chunk_counts")
+                )
+                teacher_queries = self._encode_teacher_queries(batch["query_inputs"])
+                teacher_chunks, teacher_padding = self._encode_teacher_chunks(
+                    batch.get("teacher_docs_inputs"), batch.get("teacher_chunk_counts")
+                )
+                with torch.no_grad():
+                    targets_per_sample, self_distill_total, self_distill_enabled = self._teacher_targets(
+                        teacher_queries, teacher_chunks, teacher_padding, batch["queries_chunk_indices"]
+                    )
             if loss_type == "weighted":
-                loss = self._compute_loss_weighted(queries, chunks, padding, batch["queries_chunk_indices"])
+                loss = self._compute_loss_weighted(
+                    queries, chunks, padding, batch["queries_chunk_indices"], targets_per_sample
+                )
             elif loss_type == "inbatch_inseq":
                 loss = self._compute_loss_inbatch_inseq(
-                    queries, chunks, padding, batch["queries_chunk_indices"], batch.get("n_docs_per_sample")
+                    queries, chunks, padding, batch["queries_chunk_indices"],
+                    batch.get("n_docs_per_sample"), targets_per_sample
                 )
             elif loss_type == "late_interaction":
                 raise ValueError(
@@ -602,7 +798,17 @@ class Qwen3LateChunkingModel(SentenceTransformer):
                 )
             else:
                 raise ValueError("Unknown loss_type. Supported values: weighted, inbatch_inseq, late_interaction")
-            return {"loss": loss}
+            outputs = {"loss": loss}
+            if self_distill_total is not None:
+                # The trainer performs the distributed reduction before
+                # sending these scalar values to WandB.
+                outputs["self_distill_query_gold_pairs"] = torch.tensor(
+                    self_distill_total, dtype=torch.float32, device=loss.device
+                )
+                outputs["self_distill_enabled_query_gold_pairs"] = torch.tensor(
+                    self_distill_enabled, dtype=torch.float32, device=loss.device
+                )
+            return outputs
         finally:
             self._active_chunk_offsets = None
 

@@ -8,7 +8,7 @@ set -e -u -o pipefail
 CONFIG_DIR="../contextual-embeddings/scripts/configs/examples"
 SCRIPT="../contextual-embeddings/scripts/training/training.py"
 LOG_DIR="./logs"
-TARGET="${1:-qwen3_bot*.yaml}"
+TARGET="${1:-qwen3_embedding_self*.yaml}"
 
 mkdir -p "$LOG_DIR"
 

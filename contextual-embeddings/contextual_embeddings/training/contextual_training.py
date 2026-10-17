@@ -91,6 +91,7 @@ class ContextualTraining:
                 add_prefixes=self.config.add_prefixes,
                 colbert_tokenize=self.config.colbert_tokenize,
                 chunk_encoding_mode=self.config.chunk_encoding_mode,
+                self_distillation=getattr(self.model, "self_distillation", False),
                 query_template=getattr(self.model, "query_prompt_template", None),
                 query_prefix=getattr(self.model, "query_prefix", None),
                 document_prefix=getattr(self.model, "document_prefix", None),

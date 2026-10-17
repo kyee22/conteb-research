@@ -24,6 +24,7 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
     query_prefix: Optional[str] = field(default=None, kw_only=True)
     document_prefix: Optional[str] = field(default=None, kw_only=True)
     offset_document_tokenize: Optional[Any] = field(default=None, kw_only=True)
+    self_distillation: bool = field(default=False, kw_only=True)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Tensor]:
         """Convert dataset rows into trainer-ready query/document features.
@@ -82,6 +83,25 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 batch["chunk_offsets"] = offsets
                 for key, value in tokenized.items():
                     batch[f"docs_{key}"] = value
+                if self.self_distillation:
+                    # The late student sees one complete document per row.  The
+                    # frozen teacher instead needs one tokenizer row per chunk;
+                    # ``teacher_chunk_counts`` restores those flat rows to the
+                    # original ``(document, chunk)`` layout in the model.
+                    flat_chunks = [
+                        chunk for row in features for chunk in row["docs_list"]
+                    ]
+                    prefix = self.document_prefix if self.document_prefix is not None else (
+                        "search_document: " if self.add_prefixes else ""
+                    )
+                    teacher_tok = self.tokenize_fn(
+                        [f"{prefix}{chunk}" for chunk in flat_chunks], is_query=False
+                    )
+                    for key, value in teacher_tok.items():
+                        batch[f"teacher_docs_{key}"] = value
+                    batch["teacher_chunk_counts"] = [
+                        len(row["docs_list"]) for row in features
+                    ]
                 batch["queries_chunk_indices"] = [row["queries_chunk_ids"] for row in features]
                 batch["add_prefixes"] = self.add_prefixes
                 return batch
@@ -122,6 +142,21 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 batch["n_docs_per_sample"] = [len(row["docs_list"]) for row in features]
                 for key, value in tokenized.items():
                     batch[f"docs_{key}"] = value
+                if self.self_distillation:
+                    flat_chunks = [
+                        chunk for row in features for chunk in row["docs_list"]
+                    ]
+                    prefix = self.document_prefix if self.document_prefix is not None else (
+                        "search_document: " if self.add_prefixes else ""
+                    )
+                    teacher_tok = self.tokenize_fn(
+                        [f"{prefix}{chunk}" for chunk in flat_chunks], is_query=False
+                    )
+                    for key, value in teacher_tok.items():
+                        batch[f"teacher_docs_{key}"] = value
+                    batch["teacher_chunk_counts"] = [
+                        len(row["docs_list"]) for row in features
+                    ]
                 batch["queries_chunk_indices"] = [row["queries_chunk_ids"] for row in features]
                 batch["add_prefixes"] = self.add_prefixes
                 return batch

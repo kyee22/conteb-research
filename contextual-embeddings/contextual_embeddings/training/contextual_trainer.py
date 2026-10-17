@@ -35,6 +35,10 @@ class ContextualTrainer(SentenceTransformerTrainer):
             "chunk_offsets": inputs.get("chunk_offsets"),
             "queries_chunk_indices": inputs["queries_chunk_indices"],
             "n_docs_per_sample": inputs.get("n_docs_per_sample"),
+            "teacher_docs_inputs": {
+                k: v for k, v in features[2].items()
+            } if len(features) > 2 else None,
+            "teacher_chunk_counts": inputs.get("teacher_chunk_counts"),
         }
 
         model_outputs = model(
@@ -47,6 +51,17 @@ class ContextualTrainer(SentenceTransformerTrainer):
         loss = model_outputs["loss"]
         if "diversity_loss" in model_outputs:
             self.log({"diversity_loss": model_outputs["diversity_loss"].item()})
+        if "self_distill_query_gold_pairs" in model_outputs:
+            total_pairs = self.accelerator.reduce(
+                model_outputs["self_distill_query_gold_pairs"], reduction="sum"
+            )
+            enabled_pairs = self.accelerator.reduce(
+                model_outputs["self_distill_enabled_query_gold_pairs"], reduction="sum"
+            )
+            self.log({
+                "self_distill/query_gold_pairs": total_pairs.item(),
+                "self_distill/enabled_query_gold_pairs": enabled_pairs.item(),
+            })
 
         if return_outputs:
             # During prediction/evaluation, `compute_loss` will be called with `return_outputs=True`.
