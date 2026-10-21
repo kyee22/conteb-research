@@ -160,40 +160,21 @@ class HyperContextEmbeddingModel(LongContextEmbeddingModel):
         if loss_type not in {"hypernet_infonce", "infonce", "weighted"}:
             return super().forward(*args, **kwargs)
         query_inputs, doc_inputs = args[0]["query_inputs"], args[0]["docs_inputs"]
+        chunk_offsets = args[0].get("chunk_offsets")
+        if chunk_offsets is None:
+            raise ValueError("Hyper ModernBERT contextual training requires explicit chunk_offsets")
         # Query embeddings are produced exactly as in the original model.
         query_embeddings = self._encode_query_inputs(query_inputs)
-        # Document encoding is done once for the concatenated sequence; late
-        # chunking below recovers each individual chunk representation.
-        # ``docs_context_*`` is present only for separate mode.  It contains
-        # one independently encoded chunk per row; normal docs_inputs always
-        # represent the complete concatenated document used for e^d.
-        context_inputs = {k[len("context_"):]: v for k, v in doc_inputs.items() if k.startswith("context_")}
-        # Keep the two encoder inputs separate: the document encoder must see
-        # only the concatenated document fields, while context_inputs contains
-        # the independently tokenized chunks used for e^b.
-        doc_inputs = {k: v for k, v in doc_inputs.items() if not k.startswith("context_")}
-        separate = bool(context_inputs)
+        # The document is encoded once with all chunks in context. Explicit
+        # half-open offsets then select each chunk without scanning SEP IDs.
         token_embeddings = self.base_model(doc_inputs)["token_embeddings"]
-        chunk_token_embeddings = self.base_model(context_inputs)["token_embeddings"] if separate else token_embeddings
+        chunk_embeddings, padding_mask = self._pool_offset_chunks(
+            token_embeddings, chunk_offsets
+        )
         if kwargs.get("add_prefixes", False):
             token_embeddings = token_embeddings[:, self.n_tokens_prefix:, :]
-            if separate:
-                chunk_token_embeddings = chunk_token_embeddings[:, self.n_tokens_prefix:, :]
             doc_inputs = {k: v[:, self.n_tokens_prefix:] if isinstance(v, Tensor) and v.ndim > 1 else v
                           for k, v in doc_inputs.items()}
-            if separate:
-                context_inputs = {k: v[:, self.n_tokens_prefix:] if isinstance(v, Tensor) and v.ndim > 1 else v
-                                  for k, v in context_inputs.items()}
-        doc_inputs["input_ids"] = self._add_last_join_token(doc_inputs["input_ids"], doc_inputs["attention_mask"])
-        if separate:
-            # Independent chunk encoding: each row is one chunk and cannot
-            # attend to neighboring chunks.
-            cmask = context_inputs["attention_mask"].to(chunk_token_embeddings.dtype)
-            chunk_embeddings = (chunk_token_embeddings * cmask.unsqueeze(-1)).sum(1) / cmask.sum(1, keepdim=True).clamp_min(1)
-            chunk_embeddings = chunk_embeddings.unsqueeze(1)
-            padding_mask = torch.zeros(chunk_embeddings.shape[:2], dtype=torch.bool, device=chunk_embeddings.device)
-        else:
-            chunk_embeddings, padding_mask = self._late_chunking_pooling(doc_inputs["input_ids"], token_embeddings)
         # Overall document embedding e^d: attention-mask mean over the encoded sequence.
         attn = doc_inputs["attention_mask"].to(token_embeddings.dtype)
         doc_embedding = (token_embeddings * attn.unsqueeze(-1)).sum(1) / attn.sum(1, keepdim=True).clamp_min(1)
@@ -254,29 +235,31 @@ class HyperContextEmbeddingModel(LongContextEmbeddingModel):
         outputs = []
         with torch.no_grad():
             for chunks in documents:
-                text = self.base_model.tokenizer.sep_token.join(chunks)
-                if self.add_prefix:
-                    text = "search_document: " + text
-                whole = self.tokenize([text])
+                prefix = "search_document: " if self.add_prefix else ""
+                whole, offsets = self._offset_tokenize_documents([chunks], prefix)
                 whole = {k: v.to(self.base_model.device) for k, v in whole.items() if isinstance(v, Tensor)}
                 tok = self.base_model(whole)["token_embeddings"]
+                eb, pm = self._pool_offset_chunks(tok, offsets)
+                eb = eb[0, ~pm[0]]
                 if self.add_prefix:
                     tok = tok[:, self.n_tokens_prefix:, :]
                     whole = {k: v[:, self.n_tokens_prefix:] for k, v in whole.items()}
                 mask = whole["attention_mask"].to(tok.dtype)
                 ed = (tok * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp_min(1)
                 if getattr(self, "chunk_encoding_mode", "late") == "separate":
-                    texts = [("search_document: " + c) if self.add_prefix else c for c in chunks]
+                    texts = [prefix + chunk for chunk in chunks]
                     ci = self.tokenize(texts)
                     ci = {k: v.to(self.base_model.device) for k, v in ci.items() if isinstance(v, Tensor)}
                     ct = self.base_model(ci)["token_embeddings"]
-                    if self.add_prefix:
-                        ct = ct[:, self.n_tokens_prefix:, :]
-                    cm = ci["attention_mask"][:, :ct.shape[1]].to(ct.dtype)
-                    eb = (ct * cm.unsqueeze(-1)).sum(1) / cm.sum(1, keepdim=True).clamp_min(1)
-                else:
-                    eb, pm = self._late_chunking_pooling(whole["input_ids"], tok)
-                    eb = eb[0, ~pm[0]]
+                    separate_embeddings = []
+                    for index in range(len(chunks)):
+                        start = self.n_tokens_prefix if self.add_prefix and index == 0 else 0
+                        end = int(ci["attention_mask"][index].sum().item())
+                        span = ct[index, start:end]
+                        separate_embeddings.append(
+                            span.mean(0) if span.shape[0] else ct.new_zeros(ct.shape[-1])
+                        )
+                    eb = torch.stack(separate_embeddings) if separate_embeddings else ct.new_empty((0, ct.shape[-1]))
                 ed = ed.expand(eb.shape[0], -1)
                 contextual = eb + torch.bmm(self.hypernetwork(eb), ed.unsqueeze(-1)).squeeze(-1)
                 if self.normalize_embeddings:

@@ -62,9 +62,19 @@ class Embedder:
         else:
             if self.is_contextual_model and not self._has_formatter_beir_format(data_formatter):
                 documents, document_ids = data_formatter.get_nested(col=col)
-                # embed documents in contextual models receive
-                # a list of list of documents and should return embeddings in the same shape
-                doc_embeddings = self.embed_documents(documents, batch_size=getattr(self, 'batch_size', 4))
+                long_document_encoder = getattr(self, "embed_long_document", None)
+                if len(documents) == 30 and callable(long_document_encoder):
+                    print(
+                        "[ConTEB] Dataset has exactly 30 documents; "
+                        "using embed_long_document with 10-chunk sliding-window overlap."
+                    )
+                    doc_embeddings = long_document_encoder(documents)
+                else:
+                    # Contextual embedders receive nested chunk lists and must
+                    # return the same document/chunk structure.
+                    doc_embeddings = self.embed_documents(
+                        documents, batch_size=getattr(self, "batch_size", 4)
+                    )
                 # flatten
                 document_ids = [id_ for nested_ids in document_ids for id_ in nested_ids]
                 doc_embeddings = [embed_ for nested_embeds in doc_embeddings for embed_ in nested_embeds]

@@ -48,10 +48,9 @@ from cde_benchmark.evaluators.nanobeir import NanoBEIR
 from cde_benchmark.formatters.data_formatter import DataFormatter
 
 DATASETS = [
-       "geography",
-       "covid-qa",
- 
-    # "esg-reports",
+    "esg-reports",
+    "geography",
+    "covid-qa",   
     "insurance",
     "football",
     "squad-conteb-eval",
@@ -213,7 +212,7 @@ def eval_model(
     run_longembed: bool = False,
     use_prefix: bool = False,
     data_base_path: str = "illuin-conteb",
-    save_dir: str = "results-qwen3-gather",
+    save_dir: str = "results-mb-gather",
     extend_context: bool = False,
 ):
     embedder = get_model(model_path, colbert_model, model_type, use_prefix, extend_context)
@@ -252,6 +251,7 @@ def eval_model(
         ds_path = f"{data_base_path}/{dataset}"
         split = get_split(ds_path)
         formatter = DataFormatter(ds_path, split, query_key="queries")
+        print(f"Dataset: {dataset}, Document count: {len(set(formatter.doc_dataset['doc_id']))}")
 
         ds_metrics = embedder.compute_metrics_e2e(formatter)
         metrics[dataset] = ds_metrics

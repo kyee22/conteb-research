@@ -69,7 +69,7 @@ class _FlexModernBertMixin:
         return visible[:, None, :, :]
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, inputs_embeds=None,
-                is_document=False, chunk_prefix_length=None, **kwargs):
+                is_document=False, document_prefix_length=None, **kwargs):
         is_document = is_document or getattr(
             self, "_flex_is_document", False
         )
@@ -80,14 +80,14 @@ class _FlexModernBertMixin:
             )
         if input_ids is None:
             raise ValueError("is_document requires input_ids")
-        if chunk_prefix_length is None:
-            chunk_prefix_length = getattr(self, "_flex_chunk_prefix_length", 0)
+        if document_prefix_length is None:
+            document_prefix_length = getattr(self, "_flex_document_prefix_length", 0)
         hidden_states = self.embeddings(input_ids=input_ids, inputs_embeds=inputs_embeds)
         full_mask = self._flex_attention_mask(
-            input_ids, attention_mask, int(chunk_prefix_length), getattr(self, "_flex_replace_full_with", "full")
+            input_ids, attention_mask, int(document_prefix_length), getattr(self, "_flex_replace_full_with", "full")
         )
         local_mask = self._flex_attention_mask(
-            input_ids, attention_mask, int(chunk_prefix_length), getattr(self, "_flex_replace_local_with", "chunk")
+            input_ids, attention_mask, int(document_prefix_length), getattr(self, "_flex_replace_local_with", "chunk")
         )
         attention_mask_mapping = {
             "full_attention": full_mask,
@@ -153,20 +153,20 @@ class FlexLongContextEmbeddingModel(LongContextEmbeddingModel):
     def _encode_document(self, doc_inputs):
         # SentenceTransformer.forward only forwards kwargs explicitly
         # registered by each module. ``is_document`` and
-        # ``chunk_prefix_length`` are not registered Transformer-module kwargs,
+        # ``document_prefix_length`` is not a registered Transformer-module kwarg,
         # so passing them to self.base_model here silently dropped them and the
         # patched ModernBERT forward took its normal (non-Flex) branch during
         # training. Use per-instance state, as the inference path below does,
         # so the document marker always reaches the underlying auto model.
         self._flex_auto_model._flex_is_document = True
-        self._flex_auto_model._flex_chunk_prefix_length = (
+        self._flex_auto_model._flex_document_prefix_length = (
             self.n_tokens_prefix if self._current_add_prefix else 0
         )
         try:
             return self.base_model(doc_inputs)["token_embeddings"]
         finally:
             self._flex_auto_model._flex_is_document = False
-            self._flex_auto_model._flex_chunk_prefix_length = 0
+            self._flex_auto_model._flex_document_prefix_length = 0
 
     def embed_batch_documents(self, documents):
         """Reuse the parent implementation while enabling the document mask.
@@ -180,29 +180,26 @@ class FlexLongContextEmbeddingModel(LongContextEmbeddingModel):
         # expose the prefix length as a model kwarg. Keep it on this model
         # instance so the patched ModernBERT forward can still isolate prefix
         # tokens during document inference.
-        self._flex_auto_model._flex_chunk_prefix_length = (
+        self._flex_auto_model._flex_document_prefix_length = (
             self.n_tokens_prefix if self.add_prefix else 0
         )
         try:
             return super().embed_batch_documents(documents)
         finally:
             self._flex_auto_model._flex_is_document = False
-            self._flex_auto_model._flex_chunk_prefix_length = 0
+            self._flex_auto_model._flex_document_prefix_length = 0
 
     def forward(self, *args, **kwargs):
         query_inputs = args[0]["query_inputs"]
         query_embeddings = self._encode_query_inputs(query_inputs)
         doc_inputs = args[0]["docs_inputs"]
+        chunk_offsets = args[0].get("chunk_offsets")
+        if chunk_offsets is None:
+            raise ValueError("Flex ModernBERT contextual training requires explicit chunk_offsets")
         self._current_add_prefix = bool(kwargs.get("add_prefixes", False))
         doc_token_embeddings = self._encode_document(doc_inputs)
-        if self._current_add_prefix:
-            doc_token_embeddings = doc_token_embeddings[:, self.n_tokens_prefix:, :]
-            for key, value in doc_inputs.items():
-                if isinstance(value, Tensor) and value.ndim > 1:
-                    doc_inputs[key] = value[:, self.n_tokens_prefix:]
-        doc_inputs["input_ids"] = self._add_last_join_token(doc_inputs["input_ids"], doc_inputs["attention_mask"])
-        chunk_embeddings, doc_padding_mask = self._late_chunking_pooling(
-            doc_inputs["input_ids"], doc_token_embeddings
+        chunk_embeddings, doc_padding_mask = self._pool_offset_chunks(
+            doc_token_embeddings, chunk_offsets
         )
         loss_type = kwargs.get("loss_type", "weighted")
         if loss_type == "weighted":

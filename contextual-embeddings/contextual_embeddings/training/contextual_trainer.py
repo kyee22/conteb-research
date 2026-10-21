@@ -29,15 +29,18 @@ class ContextualTrainer(SentenceTransformerTrainer):
         features, _ = self.collect_features(inputs)
 
         # Pass everything to the model and compute the loss in the model directly
+        teacher_docs_inputs = {
+            key[len("teacher_docs_"):]: value
+            for key, value in inputs.items()
+            if key.startswith("teacher_docs_")
+        }
         features_dict = {
             "query_inputs": {k: v for k, v in features[0].items()},
             "docs_inputs": {k: v for k, v in features[1].items()},
             "chunk_offsets": inputs.get("chunk_offsets"),
             "queries_chunk_indices": inputs["queries_chunk_indices"],
             "n_docs_per_sample": inputs.get("n_docs_per_sample"),
-            "teacher_docs_inputs": {
-                k: v for k, v in features[2].items()
-            } if len(features) > 2 else None,
+            "teacher_docs_inputs": teacher_docs_inputs or None,
             "teacher_chunk_counts": inputs.get("teacher_chunk_counts"),
         }
 

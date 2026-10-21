@@ -1,4 +1,5 @@
-from typing import List, Optional, Tuple
+import copy
+from typing import List, Optional
 
 import torch
 from pylate.models import ColBERT
@@ -21,6 +22,10 @@ class LongContextEmbeddingModel(SentenceTransformer):
         show_progress_bar: bool = True,
         quantization: str = None,
         query_micro_batch_size: Optional[int] = None,
+        document_micro_batch_size: Optional[int] = None,
+        self_distillation: bool = False,
+        self_distillation_rank_k: int = 2,
+        self_distillation_alpha: float = 0.5,
     ):
         super().__init__()
 
@@ -31,6 +36,15 @@ class LongContextEmbeddingModel(SentenceTransformer):
         self.normalize_embeddings = normalize_embeddings
         self.multi_ctx_training = multi_ctx_training
         self.lambda_seq = lambda_seq
+        self.self_distillation = self_distillation
+        self.self_distillation_rank_k = self_distillation_rank_k
+        self.self_distillation_alpha = self_distillation_alpha
+        if self.self_distillation_rank_k < 0:
+            raise ValueError("self_distillation_rank_k must be >= 0")
+        if self.self_distillation_rank_k == 0:
+            print("[⚠️ Warning] self_distillation_rank_k=0 disables self-distillation; set to >0 to enable")
+        if not 0.0 <= self.self_distillation_alpha <= 1.0:
+            raise ValueError("self_distillation_alpha must be in [0, 1]")
         self.n_tokens_prefix = (
             len(base_model.tokenizer(doc_prefix_str, add_special_tokens=True)["input_ids"]) - 1
         )  # - 1 to remove the [SEP] token (but count the [CLS] token)
@@ -39,6 +53,9 @@ class LongContextEmbeddingModel(SentenceTransformer):
         if query_micro_batch_size is not None and query_micro_batch_size <= 0:
             raise ValueError("query_micro_batch_size must be a positive integer or None")
         self.query_micro_batch_size = query_micro_batch_size
+        if document_micro_batch_size is not None and document_micro_batch_size <= 0:
+            raise ValueError("document_micro_batch_size must be a positive integer or None")
+        self.document_micro_batch_size = document_micro_batch_size
 
         # test fix for models that do not have a sep_token (decoders)
         if self.base_model.tokenizer.sep_token is None:
@@ -51,6 +68,31 @@ class LongContextEmbeddingModel(SentenceTransformer):
         self.join_token_id = self.base_model.tokenizer.sep_token_id
 
         self.pooling_mode = pooling_mode
+        if self.self_distillation and self.pooling_mode != "average":
+            raise ValueError("self_distillation currently requires pooling_mode='average'")
+        print(f"LongContextEmbeddingModel: lambda_seq={self.lambda_seq}")
+        print(
+            "LongContextEmbeddingModel: self_distillation="
+            f"{self.self_distillation}, rank_k={self.self_distillation_rank_k}, "
+            f"alpha={self.self_distillation_alpha}"
+        )
+
+        # The teacher is a permanent snapshot of the initial encoder. It is
+        # created only for the opt-in training intervention and never receives
+        # optimizer updates or gradients.
+        self.teacher_base_model = None
+        if self.self_distillation:
+            self.teacher_base_model = copy.deepcopy(self.base_model)
+            for parameter in self.teacher_base_model.parameters():
+                parameter.requires_grad_(False)
+            self.teacher_base_model.eval()
+
+    def train(self, mode=True):
+        """Change student mode while keeping the frozen teacher in eval mode."""
+        super().train(mode)
+        if self.teacher_base_model is not None:
+            self.teacher_base_model.eval()
+        return self
 
     def tokenize(
         # self, texts: list[str] | list[dict] | list[tuple[str, str]]
@@ -63,130 +105,110 @@ class LongContextEmbeddingModel(SentenceTransformer):
     def encode(self, args, **kwargs):
         return self.base_model.encode(args, **kwargs)
 
-    def _get_doc_indices(
-        self, batch_indices: torch.Tensor, sep_indices: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get the start and end indices of each document in a batch of sequences separated by sep_tokens.
+    def _offset_tokenize_documents(self, documents, add_prefix=""):
+        """Build one context sequence per document and record each chunk span.
 
-        Args:
-            sep_indices (torch.Tensor): indices of the sep_tokens in the input sequences of the batch\
-                  (result of torch.where)
-            batch_indices (torch.Tensor): batch indices corresponding to each sep_token (result of torch.where)
-
-        Returns:
-            starts (torch.Tensor): tensor of start indices of each document in the batch (batch_size, max_n_docs).\
-                  Contains -1 for padding values.
-            ends (torch.Tensor): tensor of end indices of each document in the batch (batch_size, max_n_docs).\
-                  Contains -1 for padding values.
+        This is the ModernBERT equivalent of Qwen3's offset tokenizer. Each
+        document remains one model row, so self-attention still crosses chunk
+        boundaries. A single CLS begins the row; every chunk contributes its
+        own content tokens followed by SEP. ``offsets[b][c] = (start, end)``
+        uses half-open positions into that row and covers chunk content only.
+        CLS, the single document-level prefix, separators, and padding are
+        excluded from every pooled span. Every source chunk, including an
+        empty/truncated one, keeps an explicit span and therefore its index.
         """
-        # Get batch size and max number of docs per sample
-        unique, counts = torch.unique(batch_indices, return_counts=True)
-        batch_size = len(unique)
+        tokenizer = self.base_model.tokenizer
+        cls_id, sep_id = tokenizer.cls_token_id, tokenizer.sep_token_id
+        if cls_id is None or sep_id is None:
+            raise ValueError("Offset-based ModernBERT encoding requires CLS and SEP token IDs")
 
-        # if isinstance(self.base_model, ColBERT):
-        #     max_docs = counts.max().item() - 1 # to uncount the last join token
-        # else:
-        #
-        max_docs = counts.max().item()
+        max_length = int(getattr(self.base_model, "max_seq_length", tokenizer.model_max_length))
+        prefix_token_count = (
+            len(tokenizer(add_prefix, add_special_tokens=False)["input_ids"])
+            if add_prefix
+            else 0
+        )
+        rows, offsets = [], []
+        for chunks in documents:
+            ids_row = [cls_id]
+            row_offsets = []
+            if len(chunks) + 1 > max_length:
+                raise ValueError(
+                    f"Document has {len(chunks)} chunks, exceeding ModernBERT sequence "
+                    f"capacity {max_length} while preserving one separator per chunk"
+                )
+            for chunk_idx, chunk in enumerate(chunks):
+                encoded = tokenizer(
+                    f"{add_prefix}{chunk}" if chunk_idx == 0 else chunk,
+                    add_special_tokens=False,
+                    truncation=False,
+                )["input_ids"]
+                # Reserve a SEP for every remaining chunk, so truncation can
+                # shorten content without silently dropping chunk identities.
+                remaining_separators = len(chunks) - chunk_idx
+                content_capacity = max_length - len(ids_row) - remaining_separators
+                content_ids = encoded[:max(0, content_capacity)]
+                # Prefix tokens occur only in the first span's input sequence,
+                # but the pooled span starts after both CLS and prefix.
+                start = 1 + prefix_token_count if chunk_idx == 0 else len(ids_row)
+                ids_row.extend(content_ids)
+                row_offsets.append((start, len(ids_row)))
+                ids_row.append(sep_id)
+            rows.append(torch.tensor(ids_row, dtype=torch.long))
+            offsets.append(row_offsets)
 
-        # Create output tensor
-        ends = (
-            torch.zeros((batch_size, max_docs), dtype=torch.long, device=batch_indices.device) - 1
-        )  # -1 is a padding value
-        starts = ends.clone()
-        starts[:, 0] = 0
+        if not rows:
+            empty = torch.empty((0, 0), dtype=torch.long)
+            return {"input_ids": empty, "attention_mask": empty}, offsets
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            rows, batch_first=True, padding_value=tokenizer.pad_token_id
+        )
+        attention_mask = torch.zeros_like(input_ids)
+        for row_idx, row in enumerate(rows):
+            attention_mask[row_idx, :row.numel()] = 1
+        return {"input_ids": input_ids, "attention_mask": attention_mask}, offsets
 
-        # Fill values using masked indexing (for each sample of the batch)
-        for i, group_idx in enumerate(unique):
-            mask = batch_indices == group_idx
-            values = sep_indices[mask]
-            # if isinstance(self.base_model, ColBERT):
-            #     ends[i, : len(values) - 1] = values[1:]
-            #     starts[i, 1 : len(values) - 1] = values[1: -1] # + 1  # shift by 1 to avoid taking the [SEP] token
-            # else:
-            #     ends[i, : len(values)] = values
-            #     starts[i, 1 : len(values)] = values[:-1] + 1  # shift by 1 to avoid taking the [SEP] token
-            ends[i, : len(values)] = values
-            starts[i, 1 : len(values)] = values[:-1] + 1  # shift by 1 to avoid taking the [SEP] token
+    @staticmethod
+    def _pool_offset_chunks(token_embeddings, offsets, pooling_mode="average"):
+        """Pool offset spans as vectors or token sequences.
 
-        return starts, ends
-
-    def _late_chunking_pooling(
-        self,
-        input_ids: torch.Tensor,
-        token_embeddings: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes the chunk (or document) embeddings for sequences of multiple documents separated by sep_tokens.
-        Returns embeddings pooled depending on the pooling mode of the model (tokens or average pooling).
-
-        Args:
-            token_embeddings (Tensor): The token embeddings of the input sequences, of shape (batch_size, seq_len, dim).
-            input_ids (Tensor): The input ids of the sequences, of shape (batch_size, seq_len).
-
-        Returns:
-            batch_embeddings (Tensor): The chunk embeddings of the input sequences, of shape \
-                (batch_size, max_n_chunks, dim), where max_n_chunks is the maximum number of chunks in the batch,
-                  in the case of average pooling.
-                For token pooling, the shape is (batch_size, max_n_chunks, max_chunk_len, dim),
-                  where max_chunk_len is the maximum length of a chunk in the batch.
-            padding_mask (Tensor): A mask indicating which chunks are padding, of shape (batch_size, max_n_chunks).
+        Average mode returns ``(batch, max_chunks, hidden)``. Token mode
+        returns ``(batch, max_chunks, max_chunk_tokens, hidden)``. The padding
+        mask marks absent chunk slots; empty source chunks remain real entries
+        containing zeros.
         """
-        # batch_indices, sep_indices = torch.where(input_ids == self.join_token_id)
-        batch_indices, sep_indices = torch.where(input_ids == self.base_model.tokenizer.sep_token_id)
-        starts, ends = self._get_doc_indices(batch_indices, sep_indices)  # (batch_size, max_n_chunks)
-
-        # Get useful values
-        batch_size, max_seq_len, dim = token_embeddings.shape
-        max_n_chunks = starts.shape[1]
-        max_chunk_len = (ends - starts).max()
-
-        # Create index tensor (to index all tokens of each chunk)
-        indices = torch.arange(max_chunk_len, device=token_embeddings.device)
-        # Repeat indices for each chunk
-        indices = indices.expand(batch_size, max_n_chunks, -1)  # (batch_size, max_n_chunks, max_chunk_len)
-        # Shift indices by start positions
-        indices = indices + starts.unsqueeze(-1)
-
-        # Create mask for valid indices
-        mask = indices < ends.unsqueeze(-1)  # (batch_size, max_n_chunks, max_chunk_len)
-
-        # Put toy index at invalid positions (for gather)
-        indices[~mask] = 0
-
-        all_chunk_lengths = ends - starts  # (batch_size, max_n_chunks)
-        all_chunk_lengths = all_chunk_lengths.masked_fill(
-            all_chunk_lengths == 0, 1
-        )  # avoid division by zero (for empty chunks)
-
-        # Gather values using advanced indexing for each chunk
-        batch_embeddings = []
-        for i in range(max_n_chunks):
-            chunk_indices = indices[:, i, :].unsqueeze(-1)  # (batch_size, max_chunk_len, 1)
-            chunk_mask = mask[:, i, :].unsqueeze(-1)
-            chunk_lengths = all_chunk_lengths[:, i].unsqueeze(-1)  # (batch_size, 1)
-
-            # Expand the chunk indices to the embedding dimension and gather the values
-            gathered = token_embeddings.gather(1, chunk_indices.expand(-1, -1, dim))  # (batch_size, max_chunk_len, dim)
-
-            # Mask invalid positions and compute mean
-            gathered = gathered.masked_fill(~chunk_mask, 0)
-
-            if self.pooling_mode == "average":
-                chunk_embeddings = gathered.sum(dim=1) / chunk_lengths  # (batch_size, dim)
-                batch_embeddings.append(chunk_embeddings)
-            elif self.pooling_mode == "tokens":
-                # If not average pooling, we keep the token embeddings
-                batch_embeddings.append(gathered)  # (batch_size, max_chunk_len, dim)
-            else:
-                raise ValueError(f"Pooling mode {self.pooling_mode} not supported. Use 'average' or 'tokens'.")
-
-        batch_embeddings = torch.stack(batch_embeddings, dim=1)
-
-        padding_mask = starts == -1
-        return (
-            batch_embeddings,
-            padding_mask,
-        )  # return the start indices for masking the loss
+        max_chunks = max((len(row) for row in offsets), default=0)
+        if pooling_mode == "tokens":
+            max_chunk_tokens = max(
+                1,
+                max((end - start for row in offsets for start, end in row), default=0),
+            )
+            pooled = token_embeddings.new_zeros(
+                (len(offsets), max_chunks, max_chunk_tokens, token_embeddings.shape[-1])
+            )
+        elif pooling_mode == "average":
+            pooled = token_embeddings.new_zeros(
+                (len(offsets), max_chunks, token_embeddings.shape[-1])
+            )
+        else:
+            raise ValueError("pooling_mode must be 'average' or 'tokens'")
+        padding = torch.ones(
+            (len(offsets), max_chunks), dtype=torch.bool, device=token_embeddings.device
+        )
+        for row_idx, row_offsets in enumerate(offsets):
+            for chunk_idx, (start, end) in enumerate(row_offsets):
+                if start < 0 or end < start or end > token_embeddings.shape[1]:
+                    raise ValueError(
+                        f"Invalid chunk offset at sample={row_idx}, chunk={chunk_idx}: "
+                        f"({start}, {end}) for sequence length {token_embeddings.shape[1]}"
+                    )
+                if end > start:
+                    if pooling_mode == "tokens":
+                        pooled[row_idx, chunk_idx, :end - start] = token_embeddings[row_idx, start:end]
+                    else:
+                        pooled[row_idx, chunk_idx] = token_embeddings[row_idx, start:end].mean(0)
+                padding[row_idx, chunk_idx] = False
+        return pooled, padding
 
     def _compute_sim(self, embeddings_a: torch.Tensor, embeddings_b: torch.Tensor) -> torch.Tensor:
         if len(embeddings_a.shape) not in [2, 3] or len(embeddings_b.shape) not in [
@@ -216,6 +238,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
         doc_padding_mask: torch.Tensor,
         queries_chunk_indices: List[List[int]],
         n_docs_per_sample: Optional[List[int]] = None,
+        targets_per_sample: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Computes a contrastive loss between queries and chunks using in-batch and in-sequence negatives.
         The queries are matched with the corresponding document among all negatives.
@@ -245,6 +268,23 @@ class LongContextEmbeddingModel(SentenceTransformer):
             loss (torch.Tensor): the cross-entropy loss between queries and documents
         """
         max_n_docs = chunk_embeddings.shape[1]
+
+        # Validate gold indices against each sample's real chunks before the
+        # batch is flattened. Otherwise an index can point at a padding slot
+        # (or appear valid only because another sample has more chunks), which
+        # hides the same student chunk-layout mismatch detected by weighted.
+        for sample_idx, sample_indices in enumerate(queries_chunk_indices):
+            valid_chunk_count = int((~doc_padding_mask[sample_idx]).sum().item())
+            invalid_indices = [
+                int(index)
+                for index in sample_indices
+                if int(index) < 0 or int(index) >= valid_chunk_count
+            ]
+            assert not invalid_indices, (
+                "Query-chunk indices do not match student late-chunking output: "
+                f"sample={sample_idx}, student_chunk_count={valid_chunk_count}, "
+                f"gold_indices={list(sample_indices)}, invalid_indices={invalid_indices}"
+            )
 
         # reshape the chunk embeddings and doc mask
         chunk_embeddings = chunk_embeddings.view(-1, chunk_embeddings.shape[-1])  # (batch_size * n_docs, dim)
@@ -288,14 +328,181 @@ class LongContextEmbeddingModel(SentenceTransformer):
             )
             assert torch.all(labels >= 0), "All labels should be valid indices (i.e. greater or equal to 0)"
 
-        loss = self.cross_entropy_loss(masked_scores, labels)
+        if targets_per_sample is None:
+            loss = self.cross_entropy_loss(masked_scores, labels)
+        else:
+            targets = torch.zeros_like(masked_scores)
+            query_offset = 0
+            if self.multi_ctx_training:
+                bases = [batch_idx * max_n_docs for batch_idx in range(len(queries_chunk_indices))]
+            else:
+                if n_docs_per_sample is None:
+                    raise ValueError("n_docs_per_sample is required for single-context training")
+                offsets = torch.tensor([0] + n_docs_per_sample[:-1], device=masked_scores.device).cumsum(0)
+                bases = offsets.tolist()
+            for batch_idx, indices in enumerate(queries_chunk_indices):
+                count = len(indices)
+                width = targets_per_sample[batch_idx].shape[1]
+                targets[query_offset:query_offset + count, bases[batch_idx]:bases[batch_idx] + width] = targets_per_sample[batch_idx]
+                query_offset += count
+            log_probs = torch.log_softmax(masked_scores, dim=-1)
+            # Padding columns contain -inf; zero-target positions must be
+            # cleared before multiplication because 0 * (-inf) is NaN.
+            loss = -(targets * log_probs).masked_fill(targets == 0, 0.0).sum(dim=-1).mean()
         return loss
 
-    def _compute_loss_from_embeddings(self, query_embeddings, doc_embeddings, labels):
+    def _compute_loss_from_embeddings(self, query_embeddings, doc_embeddings, labels, targets=None):
         # compute similarity scores
         sim_scores = self._compute_sim(query_embeddings, doc_embeddings) * self.sim_score_scale
-        # compute the cross-entropy loss
-        return self.cross_entropy_loss(sim_scores, labels)
+        if targets is None:
+            return self.cross_entropy_loss(sim_scores, labels)
+        return -(targets * torch.log_softmax(sim_scores, dim=-1)).sum(dim=-1).mean()
+
+    def _compute_teacher_targets(self, teacher_queries, teacher_chunks, teacher_padding, indices):
+        """Create rank-gated soft labels from teacher query/chunk scores."""
+        targets_per_sample = []
+        total_pairs = enabled_pairs = 0
+        query_offset = 0
+        for sample_idx, sample_indices in enumerate(indices):
+            valid = teacher_chunks[sample_idx][~teacher_padding[sample_idx]]
+            sample_queries = teacher_queries[query_offset:query_offset + len(sample_indices)]
+            query_offset += len(sample_indices)
+            logits = self._compute_sim(sample_queries, valid) * self.sim_score_scale
+            rows = []
+            for row, gold in enumerate(sample_indices):
+                total_pairs += 1
+                rank = int((torch.argsort(logits[row], descending=True) == int(gold)).nonzero(as_tuple=False).item()) + 1
+                if rank <= self.self_distillation_rank_k:
+                    enabled_pairs += 1
+                    weights = self.self_distillation_alpha * torch.exp(
+                        (logits[row] - logits[row, int(gold)]).clamp_max(0.0)
+                    )
+                    weights[int(gold)] = 1.0
+                    rows.append((weights / weights.sum()).detach())
+                else:
+                    target = torch.zeros_like(logits[row])
+                    target[int(gold)] = 1.0
+                    rows.append(target)
+            targets_per_sample.append(torch.stack(rows) if rows else logits.new_empty((0, valid.shape[0])))
+        return targets_per_sample, total_pairs, enabled_pairs
+
+    def _encode_teacher_embeddings(self, query_inputs, teacher_doc_inputs, chunk_counts):
+        """Encode teacher queries and independent chunks in the frozen space."""
+        if self.teacher_base_model is None:
+            raise ValueError("self-distillation teacher is not initialized")
+        teacher_query = self._encode_query_inputs_with_encoder(
+            self.teacher_base_model, query_inputs
+        )
+        flat = self._encode_flat_documents_with_encoder(
+            self.teacher_base_model, teacher_doc_inputs
+        )
+        if self.normalize_embeddings:
+            teacher_query = torch.nn.functional.normalize(teacher_query, dim=-1)
+            flat = torch.nn.functional.normalize(flat, dim=-1)
+        if flat.shape[0] != sum(chunk_counts):
+            raise ValueError(
+                "teacher input rows do not match teacher_chunk_counts: "
+                f"rows={flat.shape[0]}, chunk_counts={list(chunk_counts)}, "
+                f"expected={sum(chunk_counts)}"
+            )
+        max_chunks = max(chunk_counts, default=0)
+        chunks = flat.new_zeros((len(chunk_counts), max_chunks, flat.shape[-1]))
+        padding = torch.ones((len(chunk_counts), max_chunks), dtype=torch.bool, device=flat.device)
+        cursor = 0
+        for row, count in enumerate(chunk_counts):
+            chunks[row, :count] = flat[cursor:cursor + count]
+            padding[row, :count] = False
+            cursor += count
+        return teacher_query, chunks, padding
+
+    def _encode_query_inputs_with_encoder(self, encoder, query_inputs):
+        """Encode queries in micro-batches with the specified encoder."""
+        reference = query_inputs.get("input_ids", query_inputs.get("attention_mask"))
+        if reference is None:
+            raise ValueError("query_inputs must contain input_ids or attention_mask")
+        n_queries = reference.shape[0]
+        micro = self.query_micro_batch_size or n_queries
+        outputs = []
+        with torch.no_grad():
+            for start in range(0, n_queries, micro):
+                end = min(start + micro, n_queries)
+                micro_inputs = {
+                    key: value[start:end]
+                    if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == n_queries
+                    else value
+                    for key, value in query_inputs.items()
+                }
+                outputs.append(encoder(micro_inputs)["sentence_embedding"])
+        return torch.cat(outputs, dim=0)
+
+    def _encode_flat_documents_with_encoder(self, encoder, inputs):
+        """Encode flat independent teacher chunks in document micro-batches."""
+        reference = inputs.get("input_ids", inputs.get("attention_mask"))
+        if reference is None:
+            raise ValueError("teacher document inputs must contain input_ids or attention_mask")
+        n_rows = reference.shape[0]
+        micro = self.document_micro_batch_size or n_rows
+        outputs = []
+        with torch.no_grad():
+            for start in range(0, n_rows, micro):
+                end = min(start + micro, n_rows)
+                micro_inputs = {
+                    key: value[start:end]
+                    if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == n_rows
+                    else value
+                    for key, value in inputs.items()
+                }
+                outputs.append(encoder(micro_inputs)["sentence_embedding"])
+        return torch.cat(outputs, dim=0)
+
+    def _encode_documents_microbatched(self, doc_inputs, chunk_offsets):
+        """Encode complete student documents in document-sized micro-batches."""
+        batch_size = doc_inputs["input_ids"].shape[0]
+        micro = self.document_micro_batch_size or batch_size
+        pooled_outputs, padding_outputs = [], []
+        if chunk_offsets is None:
+            raise ValueError("ModernBERT contextual encoding requires explicit chunk_offsets")
+        if len(chunk_offsets) != batch_size:
+            raise ValueError(
+                "chunk_offsets must have one row per student document: "
+                f"offset_rows={len(chunk_offsets)}, documents={batch_size}"
+            )
+        for start in range(0, batch_size, micro):
+            end = min(start + micro, batch_size)
+            inputs = {
+                key: value[start:end]
+                if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size
+                else value
+                for key, value in doc_inputs.items()
+            }
+            token_embeddings = self.base_model(inputs)["token_embeddings"]
+            # Offsets define chunk identity for every ModernBERT training
+            # batch; SEP token counts are never used to infer the layout.
+            pooled, padding = self._pool_offset_chunks(
+                token_embeddings, chunk_offsets[start:end], self.pooling_mode
+            )
+            pooled_outputs.append(pooled)
+            padding_outputs.append(padding)
+        max_chunks = max(value.shape[1] for value in pooled_outputs)
+        padded_embeddings, padded_masks = [], []
+        for embeddings, padding in zip(pooled_outputs, padding_outputs):
+            missing = max_chunks - embeddings.shape[1]
+            if embeddings.ndim == 4:
+                max_chunk_tokens = max(value.shape[2] for value in pooled_outputs)
+                embeddings = torch.nn.functional.pad(
+                    embeddings,
+                    (0, 0, 0, max_chunk_tokens - embeddings.shape[2], 0, missing),
+                )
+            elif missing:
+                embeddings = torch.nn.functional.pad(embeddings, (0, 0, 0, missing))
+            if missing:
+                padding = torch.cat(
+                    [padding, torch.ones((padding.shape[0], missing), dtype=torch.bool, device=padding.device)],
+                    dim=1,
+                )
+            padded_embeddings.append(embeddings)
+            padded_masks.append(padding)
+        return torch.cat(padded_embeddings, dim=0), torch.cat(padded_masks, dim=0)
 
     def _compute_loss_batch_negatives(
         self,
@@ -327,6 +534,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
         chunk_embeddings: torch.Tensor,
         doc_padding_mask: torch.Tensor,
         queries_chunk_indices: List[List[int]],
+        targets_per_sample: Optional[List[torch.Tensor]] = None,
         # loss_type: str = "inbatch_inseq",
     ) -> torch.Tensor:
         batch_size = chunk_embeddings.shape[0]
@@ -358,6 +566,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
                     dtype=torch.long,
                     device=query_embeddings.device,
                 ),  # labels for this sample
+                targets=None if targets_per_sample is None else targets_per_sample[b_idx],
             )
             in_seq_loss_arr.append(in_sequence_loss)
 
@@ -497,19 +706,6 @@ class LongContextEmbeddingModel(SentenceTransformer):
         loss = self.lambda_seq * in_seq_mean_loss + (1 - self.lambda_seq) * in_batch_mean_loss
         return loss
 
-    def _add_last_join_token(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        # find the end of each sequence with the attention mask
-        seq_ends = attention_mask.sum(dim=1)
-        # add a column to the input_ids to make sure there is no overflow
-        input_ids = torch.cat([input_ids, torch.zeros((input_ids.shape[0], 1), device=input_ids.device)], dim=1)
-        # add a join token at that spot in each row
-        input_ids[torch.arange(input_ids.shape[0]), seq_ends] = self.join_token_id
-        return input_ids
-
     def _encode_query_inputs(self, query_inputs: dict[str, Tensor]) -> Tensor:
         """Encode queries in smaller forwards while preserving a single loss batch.
 
@@ -569,6 +765,10 @@ class LongContextEmbeddingModel(SentenceTransformer):
                   (default: weighted).
                 - "n_docs_per_sample": The number of documents per sample in the batch
                  (only needed for single context training).
+                - "teacher_docs_inputs": Flat independently tokenized chunks used
+                  only by the frozen teacher when self-distillation is enabled.
+                - "teacher_chunk_counts": Original chunk count for each document,
+                  used to restore the flat teacher rows to document groups.
                 - "add_prefixes": Whether to add prefixes to the document inputs (default: False).
         """
         query_inputs = args[0]["query_inputs"]
@@ -578,23 +778,50 @@ class LongContextEmbeddingModel(SentenceTransformer):
         # 😊 so we split the queries into smaller micro-batches
         query_embeddings = self._encode_query_inputs(query_inputs)
 
+        targets_per_sample = None
+        self_distill_total = self_distill_enabled = None
+        if self.training and self.self_distillation:
+            if kwargs.get("loss_type", "weighted") == "late_interaction":
+                raise ValueError(
+                    "self_distillation currently supports weighted and inbatch_inseq losses, "
+                    "not late_interaction"
+                )
+            teacher_doc_inputs = args[0].get("teacher_docs_inputs")
+            chunk_counts = args[0].get("teacher_chunk_counts")
+            if teacher_doc_inputs is None or chunk_counts is None:
+                raise ValueError(
+                    "self_distillation requires flat teacher chunk inputs "
+                    "and teacher_chunk_counts"
+                )
+            if len(chunk_counts) != len(kwargs["queries_chunk_indices"]):
+                raise ValueError("n_docs_per_sample must match the document batch")
+            teacher_queries, teacher_chunks, teacher_padding = self._encode_teacher_embeddings(
+                query_inputs, teacher_doc_inputs, chunk_counts
+            )
+            # The flat teacher rows are grouped solely by n_docs_per_sample;
+            # verify that every query's gold index is valid before constructing
+            # labels so a changed collator cannot silently misalign chunks.
+            for sample_idx, indices in enumerate(kwargs["queries_chunk_indices"]):
+                if any(index < 0 or index >= chunk_counts[sample_idx] for index in indices):
+                    raise ValueError("queries_chunk_indices does not match teacher chunk layout")
+            with torch.no_grad():
+                targets_per_sample, self_distill_total, self_distill_enabled = self._compute_teacher_targets(
+                    teacher_queries, teacher_chunks, teacher_padding, kwargs["queries_chunk_indices"]
+                )
+
         doc_inputs = args[0]["docs_inputs"]
-        doc_token_embeddings = self.base_model(doc_inputs)["token_embeddings"]
-
-        if kwargs.get("add_prefixes", False):
-            doc_token_embeddings = doc_token_embeddings[:, self.n_tokens_prefix :, :]
-            for k, v in doc_inputs.items():
-                doc_inputs[k] = v[:, self.n_tokens_prefix :]
-
-        doc_inputs["input_ids"] = self._add_last_join_token(
-            doc_inputs["input_ids"],
-            doc_inputs["attention_mask"],
-        )  # add the join token at the end of each sequence
-
-        # for now, assume multi-docs
-        chunk_embeddings, doc_padding_mask = self._late_chunking_pooling(
-            doc_inputs["input_ids"],
-            doc_token_embeddings,
+        chunk_offsets = args[0].get("chunk_offsets")
+        if chunk_offsets is None:
+            raise ValueError("ModernBERT contextual training requires explicit chunk_offsets")
+        if self.training and self.self_distillation:
+            offset_counts = [len(row) for row in chunk_offsets]
+            if offset_counts != list(chunk_counts):
+                raise ValueError(
+                    "student chunk_offsets do not match teacher_chunk_counts: "
+                    f"student={offset_counts}, teacher={list(chunk_counts)}"
+                )
+        chunk_embeddings, doc_padding_mask = self._encode_documents_microbatched(
+            doc_inputs, chunk_offsets
         )
 
         if self.pooling_mode not in {"average", "tokens"}:
@@ -606,6 +833,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
                 chunk_embeddings,
                 doc_padding_mask,
                 kwargs["queries_chunk_indices"],
+                targets_per_sample,
             )
         elif kwargs["loss_type"] == "inbatch_inseq":
             # in-seq and in-batch negatives
@@ -615,6 +843,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
                 doc_padding_mask,
                 kwargs["queries_chunk_indices"],
                 kwargs.get("n_docs_per_sample"),
+                targets_per_sample,
             )
 
         elif kwargs["loss_type"] == "late_interaction":
@@ -630,7 +859,15 @@ class LongContextEmbeddingModel(SentenceTransformer):
                               Supported types are: inbatch_inseq, weighted, late_interaction."
             )
 
-        return {"loss": loss}
+        outputs = {"loss": loss}
+        if self_distill_total is not None:
+            outputs["self_distill_query_gold_pairs"] = torch.tensor(
+                self_distill_total, dtype=torch.float32, device=loss.device
+            )
+            outputs["self_distill_enabled_query_gold_pairs"] = torch.tensor(
+                self_distill_enabled, dtype=torch.float32, device=loss.device
+            )
+        return outputs
 
     def embed_queries(self, queries):
         """
@@ -667,41 +904,6 @@ class LongContextEmbeddingModel(SentenceTransformer):
                 outputs = outputs[:, self.n_tokens_prefix :, :]
 
         return outputs
-
-    def _tokenize_docs(self, documents):
-        inputs_list = []
-
-        # iterate over each document, which is a list of chunks
-        for docs in documents:
-            # tokenize all chunks
-            doc_inputs = self.tokenize(docs, is_query=False)
-            # remove CLS token from all inputs except the first
-            doc_inputs = {k: v[:, 1:] for k, v in doc_inputs.items()}
-
-            input_ids = doc_inputs["input_ids"]
-            attention_mask = doc_inputs["attention_mask"]
-            # take only the ids of the valid tokens of all chunks
-            valid_input_ids_list = [input_ids[i, : attention_mask[i].sum()] for i in range(input_ids.shape[0])]
-            # concat all chunks together
-            concat_seq = torch.cat(valid_input_ids_list, dim=0)
-            # add a join_token at the end for the late chunking pooling logic
-            concat_seq = torch.cat(
-                [concat_seq, torch.tensor([self.join_token_id], device=concat_seq.device)],
-                dim=0,
-            )
-            inputs_list.append(concat_seq)
-
-        # pad the sequences
-        padded_inputs = torch.nn.utils.rnn.pad_sequence(inputs_list, batch_first=True)
-        # add the attention mask
-        attention_mask = torch.zeros(padded_inputs.shape[0], padded_inputs.shape[1], device=padded_inputs.device)
-        for i in range(padded_inputs.shape[0]):
-            attention_mask[i, : len(inputs_list[i]) - 1] = 1
-
-        return {
-            "input_ids": padded_inputs,
-            "attention_mask": attention_mask,
-        }
 
     def _partition_long_doc(self, doc_chunks, n_chunks_overlap: Optional[int] = 10):
         # tokenize all chunks
@@ -783,6 +985,86 @@ class LongContextEmbeddingModel(SentenceTransformer):
 
         return valid_chunk_embeddings
 
+    def embed_long_document(self, documents, n_chunks_overlap: int = 10):
+        """Embed a nested document collection using overlapping context windows.
+
+        Args:
+            documents: Documents in the same ``list[list[str]]`` format accepted
+                by :meth:`embed_documents`.
+            n_chunks_overlap: Number of chunks carried from each window into
+                the next window as context for each source document.
+
+        Returns:
+            Nested chunk embeddings aligned with the input documents and chunks.
+
+        Window capacity is measured using the tokenizer's content-token count,
+        plus one CLS token, one SEP per chunk, and the single document prefix.
+        If an individual chunk exceeds the available capacity, the existing
+        offset tokenizer truncates that chunk while preserving its output slot.
+        """
+        if n_chunks_overlap < 0:
+            raise ValueError("n_chunks_overlap must be >= 0")
+        print(
+            "[LongDocument] Sliding-window embedding: "
+            f"documents={len(documents)}, chunk_overlap={n_chunks_overlap}"
+        )
+        return [
+            self._embed_one_long_document(doc_chunks, n_chunks_overlap)
+            for doc_chunks in documents
+        ]
+
+    def _embed_one_long_document(self, doc_chunks, n_chunks_overlap):
+        if not doc_chunks:
+            return []
+
+        tokenizer = self.base_model.tokenizer
+        max_length = int(getattr(self.base_model, "max_seq_length", tokenizer.model_max_length))
+        prefix = "search_document: " if self.add_prefix else ""
+        prefix_tokens = (
+            len(tokenizer(prefix, add_special_tokens=False)["input_ids"]) if prefix else 0
+        )
+        available_content = max_length - 1 - prefix_tokens
+        chunk_lengths = [
+            len(tokenizer(chunk, add_special_tokens=False, truncation=False)["input_ids"])
+            for chunk in doc_chunks
+        ]
+
+        windows = []
+        window_start = 0
+        while window_start < len(doc_chunks):
+            window_end = window_start
+            content_length = 0
+            while window_end < len(doc_chunks):
+                candidate_length = content_length + chunk_lengths[window_end] + 1
+                if window_end > window_start and candidate_length > available_content:
+                    break
+                content_length = candidate_length
+                window_end += 1
+
+            if window_end == window_start:
+                window_end += 1
+            windows.append((window_start, window_end))
+            if window_end == len(doc_chunks):
+                break
+            next_start = max(window_start + 1, window_end - n_chunks_overlap)
+            window_start = next_start
+
+        print(f"[LongDocument] chunks={len(doc_chunks)}, windows={windows}")
+        outputs = []
+        previous_end = 0
+        for window_idx, (start, end) in enumerate(windows):
+            window_embeddings = self.embed_batch_documents([doc_chunks[start:end]])[0]
+            keep_from = 0 if window_idx == 0 else previous_end - start
+            outputs.extend(window_embeddings[keep_from:])
+            previous_end = end
+
+        if len(outputs) != len(doc_chunks):
+            raise RuntimeError(
+                "Sliding-window embedding did not preserve chunk alignment: "
+                f"input={len(doc_chunks)}, output={len(outputs)}, windows={windows}"
+            )
+        return outputs
+
     def embed_batch_documents(self, documents):
         """
         Embeds a batch of documents, where each document is a list of chunks.
@@ -794,63 +1076,39 @@ class LongContextEmbeddingModel(SentenceTransformer):
                 and contains one embedding per input chunk. Chunks removed by tokenizer truncation are represented by
                 zero-valued placeholder embeddings appended in their original trailing positions.
         """
-        # documents are lists of chunks
+        # Documents are lists of source chunks. Use the same explicit offset
+        # contract as training and Qwen3 inference; never recover boundaries by
+        # counting SEP IDs after tokenization.
         self.base_model.eval()
-
-        # Process each document individually to avoid NaN issues with
-        # ModernBERT when batching sequences of unequal lengths.
         outputs = []
         for doc in documents:
             if not doc:
                 outputs.append([])
                 continue
 
-            doc_string = self.base_model.tokenizer.sep_token.join(doc)
-            if self.add_prefix:
-                doc_string = "search_document: " + doc_string
-
-            if isinstance(self.base_model, ColBERT):
-                doc_inputs = self.tokenize([doc_string], is_query=False)
-            else:
-                doc_inputs = self.tokenize([doc_string])
-            doc_inputs = {k: v.to(self.base_model.device) for k, v in doc_inputs.items() if isinstance(v, torch.Tensor)}
+            prefix = "search_document: " if self.add_prefix else ""
+            doc_inputs, offsets = self._offset_tokenize_documents([doc], prefix)
+            doc_inputs = {
+                key: value.to(self.base_model.device)
+                for key, value in doc_inputs.items()
+                if isinstance(value, torch.Tensor)
+            }
 
             with torch.no_grad():
                 doc_embeddings = self.base_model(doc_inputs)["token_embeddings"]
-
-            if self.add_prefix:
-                doc_embeddings = doc_embeddings[:, self.n_tokens_prefix :, :]
-                for k, v in doc_inputs.items():
-                    doc_inputs[k] = v[:, self.n_tokens_prefix :]
-
-            chunk_embeddings, padding_mask = self._late_chunking_pooling(doc_inputs["input_ids"], doc_embeddings)
+            chunk_embeddings, padding_mask = self._pool_offset_chunks(
+                doc_embeddings, offsets, self.pooling_mode
+            )
             if self.normalize_embeddings:
                 chunk_embeddings = torch.nn.functional.normalize(chunk_embeddings, p=2, dim=-1)
 
             filtered = chunk_embeddings[0, ~padding_mask[0]]
-            embedding_list = [filtered[j].cpu() for j in range(filtered.shape[0])]
-            expected_embeddings = len(doc)
-            actual_embeddings = len(embedding_list)
-            truncated_embeddings = expected_embeddings - actual_embeddings
-
-            if truncated_embeddings < 0:
+            embedding_list = [filtered[j].cpu() for j in range(len(doc))]
+            if len(embedding_list) != len(doc):
                 raise ValueError(
-                    "The tokenized document produced more chunk embeddings than "
-                    f"expected: expected {expected_embeddings}, got {actual_embeddings}."
+                    "Explicit chunk offsets do not match the input document: "
+                    f"expected={len(doc)}, got={len(embedding_list)}"
                 )
-            if truncated_embeddings:
-                print(
-                    "[DEBUG][long-context ⚠️ ] "
-                    f"expected_embeddings={expected_embeddings}, "
-                    f"actual_embeddings={actual_embeddings}, "
-                    f"truncated_embeddings={truncated_embeddings}"
-                )
-                special_embedding = torch.zeros_like(chunk_embeddings[0, 0]).cpu()
-                embedding_list.extend(
-                    special_embedding.clone() for _ in range(truncated_embeddings)
-                )
-
-            assert len(embedding_list) == expected_embeddings
             outputs.append(embedding_list)
 
         return outputs

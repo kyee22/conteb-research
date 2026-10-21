@@ -36,6 +36,7 @@ def get_dataset_from_beir_format(
     grouped_chunks = grouped_chunks.rename(columns={"chunk": "docs_list"})
 
     assert grouped_chunks["chunk_id"].apply(lambda x: x == sorted(x)).all()
+
     grouped_chunks = grouped_chunks.drop(columns=["chunk_id"])
 
     # concatenate chunks with sep_tokens (keep the list as a separate entry)

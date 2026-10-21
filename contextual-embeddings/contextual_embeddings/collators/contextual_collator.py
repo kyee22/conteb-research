@@ -52,6 +52,26 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
         # We should always be able to return a loss, label or not:
         batch = {}
 
+        def flatten_teacher_chunks(prefix):
+            """Treat every isolated teacher chunk as its own prefixed document."""
+            return [
+                f"{prefix}{chunk}"
+                for row in features
+                for chunk in row["docs_list"]
+            ]
+
+        def tokenize_teacher_chunks(prefix):
+            """Tokenize independent teacher documents using the active tokenizer API.
+
+            SentenceTransformer tokenizers accept text lists directly. The
+            ``is_query`` flag belongs only to the ColBERT tokenization path;
+            passing it to a regular ModernBERT tokenizer is unsupported.
+            """
+            chunks = flatten_teacher_chunks(prefix)
+            if self.colbert_tokenize:
+                return self.tokenize_fn(chunks, is_query=False)
+            return self.tokenize_fn(chunks)
+
         # tokenize the queries
 
         # merge the lists of queries into one list for the tokenizer
@@ -88,15 +108,10 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                     # frozen teacher instead needs one tokenizer row per chunk;
                     # ``teacher_chunk_counts`` restores those flat rows to the
                     # original ``(document, chunk)`` layout in the model.
-                    flat_chunks = [
-                        chunk for row in features for chunk in row["docs_list"]
-                    ]
                     prefix = self.document_prefix if self.document_prefix is not None else (
                         "search_document: " if self.add_prefixes else ""
                     )
-                    teacher_tok = self.tokenize_fn(
-                        [f"{prefix}{chunk}" for chunk in flat_chunks], is_query=False
-                    )
+                    teacher_tok = tokenize_teacher_chunks(prefix)
                     for key, value in teacher_tok.items():
                         batch[f"teacher_docs_{key}"] = value
                     batch["teacher_chunk_counts"] = [
@@ -117,6 +132,16 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 tokenized = self.tokenize_fn(concatenated_docs, is_query=False)
             else:
                 tokenized = self.tokenize_fn(concatenated_docs)
+            if self.self_distillation:
+                # Preserve the historical late-document student input while
+                # adding one independent tokenizer row per chunk for teacher.
+                prefix = self.document_prefix if self.document_prefix is not None else (
+                    "search_document: " if self.add_prefixes else ""
+                )
+                teacher_tok = tokenize_teacher_chunks(prefix)
+                for key, value in teacher_tok.items():
+                    batch[f"teacher_docs_{key}"] = value
+                batch["teacher_chunk_counts"] = [len(row["docs_list"]) for row in features]
             if self.chunk_encoding_mode == "separate":
                 batch["n_docs_per_sample"] = [len(row["docs_list"]) for row in features]
                 flat_chunks = [doc for row in features for doc in row["docs_list"]]
@@ -143,15 +168,10 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 for key, value in tokenized.items():
                     batch[f"docs_{key}"] = value
                 if self.self_distillation:
-                    flat_chunks = [
-                        chunk for row in features for chunk in row["docs_list"]
-                    ]
                     prefix = self.document_prefix if self.document_prefix is not None else (
                         "search_document: " if self.add_prefixes else ""
                     )
-                    teacher_tok = self.tokenize_fn(
-                        [f"{prefix}{chunk}" for chunk in flat_chunks], is_query=False
-                    )
+                    teacher_tok = tokenize_teacher_chunks(prefix)
                     for key, value in teacher_tok.items():
                         batch[f"teacher_docs_{key}"] = value
                     batch["teacher_chunk_counts"] = [
@@ -176,6 +196,16 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 tokenized = self.tokenize_fn(flattened_docs, is_query=False)
             else:
                 tokenized = self.tokenize_fn(flattened_docs)
+            if self.self_distillation:
+                # ``flattened_docs`` already follows document/chunk order;
+                # tokenize the same chunks independently for the teacher.
+                prefix = self.document_prefix if self.document_prefix is not None else (
+                    "search_document: " if self.add_prefixes else ""
+                )
+                teacher_tok = tokenize_teacher_chunks(prefix)
+                for key, value in teacher_tok.items():
+                    batch[f"teacher_docs_{key}"] = value
+                batch["teacher_chunk_counts"] = [len(row["docs_list"]) for row in features]
             if self.chunk_encoding_mode == "separate":
                 # In single-context mode ``flattened_docs`` already contains
                 # one row per chunk, so reuse its tokenization as the

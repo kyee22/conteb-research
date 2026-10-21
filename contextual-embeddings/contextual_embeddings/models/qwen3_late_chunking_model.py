@@ -105,8 +105,10 @@ class Qwen3LateChunkingModel(SentenceTransformer):
         self.self_distillation = kwargs.pop("self_distillation", False)
         self.self_distillation_rank_k = kwargs.pop("self_distillation_rank_k", 2)
         self.self_distillation_alpha = kwargs.pop("self_distillation_alpha", 0.5)
-        if self.self_distillation_rank_k < 1:
-            raise ValueError("self_distillation_rank_k must be >= 1")
+        if self.self_distillation_rank_k < 0:
+            raise ValueError("self_distillation_rank_k must be >= 0")
+        if self.self_distillation_rank_k == 0:
+            print("[⚠️ Warning] self_distillation_rank_k=0 disables self-distillation; set to >0 to enable")
         if not 0.0 <= self.self_distillation_alpha <= 1.0:
             raise ValueError("self_distillation_alpha must be in [0, 1]")
         print(f"Qwen3LateChunkingModel: lambda_seq={self.lambda_seq}")

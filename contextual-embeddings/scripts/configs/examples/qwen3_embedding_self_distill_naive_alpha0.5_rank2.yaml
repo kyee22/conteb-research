@@ -28,17 +28,17 @@ config:
     self_distillation: True
     # Enable soft labels only when the frozen teacher ranks the gold chunk in
     # its top-k: 1 <= rank_teacher(gold) <= self_distillation_rank_k.
-    self_distillation_rank_k: 5
+    self_distillation_rank_k: 2
     # For a gated query, teacher chunk j receives the unnormalized weight
     # alpha * min(1, exp((s_teacher[j]-s_teacher[gold]) * sim_score_scale));
     # weights are normalized across that document's valid chunks.
     self_distillation_alpha: 0.5
     # Keep the device batch (and therefore in-batch negatives) intact while
     # encoding each side in smaller forwards to reduce attention memory.
-    query_micro_batch_size: 8
-    document_micro_batch_size: 1
+    query_micro_batch_size: 16
+    document_micro_batch_size: 2
   multi_ctx_training: !cfg multi_ctx_training
-  loss_type: "weighted"
+  loss_type: "inbatch_inseq"
   exp_name: "qwen3-embedding-0.6b-late-chunking-self-distill"
   n_gpus: 4
   output_dir: "./checkpoints/qwen3-embedding-0.6b"

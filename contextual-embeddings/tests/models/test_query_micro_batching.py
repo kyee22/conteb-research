@@ -7,15 +7,27 @@ from contextual_embeddings.models.long_context_model import LongContextEmbedding
 class DummyTokenizer:
     sep_token = "[SEP]"
     sep_token_id = 2
+    cls_token_id = 1
+    pad_token_id = 0
+    model_max_length = 12
 
-    def __call__(self, text, add_special_tokens=True):
-        return {"input_ids": [1, 2]}
+    def __init__(self):
+        self.seen_texts = []
+
+    def __call__(self, text, add_special_tokens=True, truncation=True):
+        self.seen_texts.append(text)
+        if text == "search_document: ":
+            return {"input_ids": [9, 10]}
+        if text.startswith("search_document: "):
+            return {"input_ids": [9, 10, 3, 4]}
+        return {"input_ids": [3, 4]}
 
 
 class DummyBaseModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.tokenizer = DummyTokenizer()
+        self.max_seq_length = 12
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.forward_shapes = []
 
@@ -58,3 +70,35 @@ def test_query_micro_batch_size_must_be_positive():
         assert "query_micro_batch_size" in str(error)
     else:
         raise AssertionError("Expected query_micro_batch_size=0 to fail")
+
+
+def test_offset_tokenization_preserves_chunk_layout_and_pooling():
+    model = LongContextEmbeddingModel(DummyBaseModel(), document_micro_batch_size=1)
+    model.base_model.tokenizer.seen_texts.clear()
+    inputs, offsets = model._offset_tokenize_documents(
+        [["first", "second", "third"], ["only"]], add_prefix="search_document: "
+    )
+
+    assert model.base_model.tokenizer.seen_texts == [
+        "search_document: ", "search_document: first", "second", "third",
+        "search_document: only",
+    ]
+    assert offsets == [[(3, 5), (6, 8), (9, 11)], [(3, 5)]]
+    assert inputs["attention_mask"].sum(dim=1).tolist() == [12, 6]
+    assert len(offsets[0]) == 3  # Every source chunk keeps its identity and order.
+
+    hidden = torch.arange(2 * 12 * 2, dtype=torch.float32).reshape(2, 12, 2)
+    pooled, padding = model._pool_offset_chunks(hidden, offsets)
+    assert pooled.shape == (2, 3, 2)
+    assert padding.tolist() == [[False, False, False], [False, True, True]]
+    assert torch.equal(pooled[0, 0], hidden[0, 3:5].mean(0))
+
+    _, unprefixed_offsets = model._offset_tokenize_documents([["first", "second"]])
+    assert unprefixed_offsets == [[(1, 3), (4, 6)]]
+
+    token_chunks, token_padding = model._pool_offset_chunks(
+        hidden, offsets, pooling_mode="tokens"
+    )
+    assert token_chunks.shape == (2, 3, 2, 2)
+    assert token_padding.tolist() == [[False, False, False], [False, True, True]]
+    assert torch.equal(token_chunks[0, 0], hidden[0, 3:5])

@@ -72,6 +72,7 @@ class ContextualTraining:
         """
         Train the model using the provided configuration.
         """
+        offset_tokenizer = getattr(self.model, "_offset_tokenize_documents", None)
         trainer = ContextualTrainer(
             training_loss_type=self.config.loss_type,
             model=self.model,
@@ -95,7 +96,10 @@ class ContextualTraining:
                 query_template=getattr(self.model, "query_prompt_template", None),
                 query_prefix=getattr(self.model, "query_prefix", None),
                 document_prefix=getattr(self.model, "document_prefix", None),
-                offset_document_tokenize=getattr(self.model, "_offset_tokenize_documents", None),
+                # All contextual models with an offset tokenizer use explicit
+                # chunk boundaries in training, regardless of loss type or
+                # self-distillation mode.
+                offset_document_tokenize=offset_tokenizer,
             ),
         )
 

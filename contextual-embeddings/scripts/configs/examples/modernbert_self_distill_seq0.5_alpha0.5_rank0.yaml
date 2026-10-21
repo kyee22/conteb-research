@@ -1,0 +1,72 @@
+multi_ctx_training: True
+base_model:
+  (): sentence_transformers.SentenceTransformer
+  model_name_or_path: "lightonai/modernbert-embed-large"
+  model_kwargs:
+    attn_implementation: "sdpa"
+    torch_dtype: !ext torch.bfloat16
+
+config:
+  (): contextual_embeddings.ContextualTrainingConfig
+  add_prefixes: True
+
+  model: 
+    (): contextual_embeddings.LongContextEmbeddingModel
+    base_model: !cfg base_model # points to the variable defined above
+    multi_ctx_training: !cfg multi_ctx_training
+    lambda_seq: 0.5
+    # Training-only self-distillation from a permanently frozen initial encoder.
+    self_distillation: True
+    self_distillation_rank_k: 0
+    self_distillation_alpha: 0.5
+    query_micro_batch_size: 32
+    document_micro_batch_size: 16
+  multi_ctx_training: !cfg multi_ctx_training # passed to both model and trainer
+  loss_type: "weighted"
+  exp_name: "modernbert-self-distill"
+  n_gpus: 4
+  output_dir: "./checkpoints/test"
+  train_dataset: 
+    (): contextual_embeddings.models.utils.get_long_context_dataset # function returning the dataset
+    base_model: !cfg base_model
+  eval_dataset: 
+    mldr:
+      (): contextual_embeddings.models.utils.create_contextual_dataset 
+      path: "illuin-conteb/mldr-conteb-train"
+      split: "test"
+      base_model: !cfg base_model
+    squad:
+      (): contextual_embeddings.models.utils.create_contextual_dataset
+      path: "illuin-conteb/squad-conteb-train"
+      split: "validation"
+      base_model: !cfg base_model
+      all_queries: False
+    narrative_qa:
+      (): contextual_embeddings.models.utils.create_contextual_dataset 
+      path: "illuin-conteb/narrative-qa"
+      split: "test"
+      base_model: !cfg base_model
+      all_queries: False
+  run_train: True
+  training_args: 
+    (): sentence_transformers.SentenceTransformerTrainingArguments
+    output_dir: null
+    num_train_epochs: 2
+    per_device_train_batch_size: 4
+    per_device_eval_batch_size: 4
+    fp16: False  # Set to False if you get an error that your GPU can't run on FP16
+    bf16: True  # Set to True if you have a GPU that supports BF16
+
+    gradient_checkpointing: True
+    gradient_checkpointing_kwargs:
+      use_reentrant: False
+
+    ddp_find_unused_parameters: False
+    learning_rate: 5e-5
+    warmup_ratio: 0.05
+    lr_scheduler_type: "cosine"
+    eval_strategy: "steps"
+    eval_on_start: True
+    eval_steps: 100
+    logging_steps: 10  # how often to log to W&B
+    report_to: "wandb"  
