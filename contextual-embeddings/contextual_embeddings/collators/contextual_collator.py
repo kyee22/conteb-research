@@ -25,6 +25,7 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
     document_prefix: Optional[str] = field(default=None, kw_only=True)
     offset_document_tokenize: Optional[Any] = field(default=None, kw_only=True)
     self_distillation: bool = field(default=False, kw_only=True)
+    self_distillation_teacher_full_document: bool = field(default=False, kw_only=True)
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Tensor]:
         """Convert dataset rows into trainer-ready query/document features.
@@ -111,7 +112,11 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                     prefix = self.document_prefix if self.document_prefix is not None else (
                         "search_document: " if self.add_prefixes else ""
                     )
-                    teacher_tok = tokenize_teacher_chunks(prefix)
+                    teacher_tok = (
+                        tokenized
+                        if self.self_distillation_teacher_full_document
+                        else tokenize_teacher_chunks(prefix)
+                    )
                     for key, value in teacher_tok.items():
                         batch[f"teacher_docs_{key}"] = value
                     batch["teacher_chunk_counts"] = [
@@ -138,7 +143,11 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 prefix = self.document_prefix if self.document_prefix is not None else (
                     "search_document: " if self.add_prefixes else ""
                 )
-                teacher_tok = tokenize_teacher_chunks(prefix)
+                teacher_tok = (
+                    tokenized
+                    if self.self_distillation_teacher_full_document
+                    else tokenize_teacher_chunks(prefix)
+                )
                 for key, value in teacher_tok.items():
                     batch[f"teacher_docs_{key}"] = value
                 batch["teacher_chunk_counts"] = [len(row["docs_list"]) for row in features]
@@ -171,7 +180,11 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                     prefix = self.document_prefix if self.document_prefix is not None else (
                         "search_document: " if self.add_prefixes else ""
                     )
-                    teacher_tok = tokenize_teacher_chunks(prefix)
+                    teacher_tok = (
+                        tokenized
+                        if self.self_distillation_teacher_full_document
+                        else tokenize_teacher_chunks(prefix)
+                    )
                     for key, value in teacher_tok.items():
                         batch[f"teacher_docs_{key}"] = value
                     batch["teacher_chunk_counts"] = [
@@ -202,7 +215,11 @@ class ContextualDataCollator(SentenceTransformerDataCollator):
                 prefix = self.document_prefix if self.document_prefix is not None else (
                     "search_document: " if self.add_prefixes else ""
                 )
-                teacher_tok = tokenize_teacher_chunks(prefix)
+                teacher_tok = (
+                    tokenized
+                    if self.self_distillation_teacher_full_document
+                    else tokenize_teacher_chunks(prefix)
+                )
                 for key, value in teacher_tok.items():
                     batch[f"teacher_docs_{key}"] = value
                 batch["teacher_chunk_counts"] = [len(row["docs_list"]) for row in features]

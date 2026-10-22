@@ -26,6 +26,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
         self_distillation: bool = False,
         self_distillation_rank_k: int = 2,
         self_distillation_alpha: float = 0.5,
+        self_distillation_teacher_full_document: bool = False,
     ):
         super().__init__()
 
@@ -39,6 +40,7 @@ class LongContextEmbeddingModel(SentenceTransformer):
         self.self_distillation = self_distillation
         self.self_distillation_rank_k = self_distillation_rank_k
         self.self_distillation_alpha = self_distillation_alpha
+        self.self_distillation_teacher_full_document = self_distillation_teacher_full_document
         if self.self_distillation_rank_k < 0:
             raise ValueError("self_distillation_rank_k must be >= 0")
         if self.self_distillation_rank_k == 0:
@@ -415,6 +417,57 @@ class LongContextEmbeddingModel(SentenceTransformer):
             cursor += count
         return teacher_query, chunks, padding
 
+    def _encode_full_document_teacher_embeddings(self, query_inputs, teacher_doc_inputs, chunk_offsets):
+        """Encode teacher queries and pool chunks from full-document teacher rows."""
+        if self.teacher_base_model is None:
+            raise ValueError("self-distillation teacher is not initialized")
+        teacher_query = self._encode_query_inputs_with_encoder(
+            self.teacher_base_model, query_inputs
+        )
+        batch_size = teacher_doc_inputs["input_ids"].shape[0]
+        if len(chunk_offsets) != batch_size:
+            raise ValueError(
+                "chunk_offsets must have one row per teacher document: "
+                f"offset_rows={len(chunk_offsets)}, documents={batch_size}"
+            )
+        micro = self.document_micro_batch_size or batch_size
+        pooled_outputs, padding_outputs = [], []
+        with torch.no_grad():
+            for start in range(0, batch_size, micro):
+                end = min(start + micro, batch_size)
+                micro_inputs = {
+                    key: value[start:end]
+                    if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size
+                    else value
+                    for key, value in teacher_doc_inputs.items()
+                }
+                token_embeddings = self.teacher_base_model(micro_inputs)["token_embeddings"]
+                pooled, padding = self._pool_offset_chunks(
+                    token_embeddings, chunk_offsets[start:end], "average"
+                )
+                pooled_outputs.append(pooled)
+                padding_outputs.append(padding)
+        max_chunks = max(value.shape[1] for value in pooled_outputs)
+        chunks = torch.cat([
+            torch.nn.functional.pad(value, (0, 0, 0, max_chunks - value.shape[1]))
+            for value in pooled_outputs
+        ], dim=0)
+        padding = torch.cat([
+            torch.cat([
+                value,
+                torch.ones(
+                    (value.shape[0], max_chunks - value.shape[1]),
+                    dtype=torch.bool,
+                    device=value.device,
+                ),
+            ], dim=1)
+            for value in padding_outputs
+        ], dim=0)
+        if self.normalize_embeddings:
+            teacher_query = torch.nn.functional.normalize(teacher_query, dim=-1)
+            chunks = torch.nn.functional.normalize(chunks, dim=-1)
+        return teacher_query, chunks, padding
+
     def _encode_query_inputs_with_encoder(self, encoder, query_inputs):
         """Encode queries in micro-batches with the specified encoder."""
         reference = query_inputs.get("input_ids", query_inputs.get("attention_mask"))
@@ -765,8 +818,8 @@ class LongContextEmbeddingModel(SentenceTransformer):
                   (default: weighted).
                 - "n_docs_per_sample": The number of documents per sample in the batch
                  (only needed for single context training).
-                - "teacher_docs_inputs": Flat independently tokenized chunks used
-                  only by the frozen teacher when self-distillation is enabled.
+                - "teacher_docs_inputs": Teacher document rows, either independent
+                  chunks or full documents depending on self-distillation settings.
                 - "teacher_chunk_counts": Original chunk count for each document,
                   used to restore the flat teacher rows to document groups.
                 - "add_prefixes": Whether to add prefixes to the document inputs (default: False).
@@ -777,6 +830,10 @@ class LongContextEmbeddingModel(SentenceTransformer):
 
         # 😊 so we split the queries into smaller micro-batches
         query_embeddings = self._encode_query_inputs(query_inputs)
+        doc_inputs = args[0]["docs_inputs"]
+        chunk_offsets = args[0].get("chunk_offsets")
+        if chunk_offsets is None:
+            raise ValueError("ModernBERT contextual training requires explicit chunk_offsets")
 
         targets_per_sample = None
         self_distill_total = self_distill_enabled = None
@@ -790,14 +847,21 @@ class LongContextEmbeddingModel(SentenceTransformer):
             chunk_counts = args[0].get("teacher_chunk_counts")
             if teacher_doc_inputs is None or chunk_counts is None:
                 raise ValueError(
-                    "self_distillation requires flat teacher chunk inputs "
+                    "self_distillation requires teacher document inputs "
                     "and teacher_chunk_counts"
                 )
             if len(chunk_counts) != len(kwargs["queries_chunk_indices"]):
                 raise ValueError("n_docs_per_sample must match the document batch")
-            teacher_queries, teacher_chunks, teacher_padding = self._encode_teacher_embeddings(
-                query_inputs, teacher_doc_inputs, chunk_counts
-            )
+            if self.self_distillation_teacher_full_document:
+                teacher_queries, teacher_chunks, teacher_padding = (
+                    self._encode_full_document_teacher_embeddings(
+                        query_inputs, teacher_doc_inputs, chunk_offsets
+                    )
+                )
+            else:
+                teacher_queries, teacher_chunks, teacher_padding = self._encode_teacher_embeddings(
+                    query_inputs, teacher_doc_inputs, chunk_counts
+                )
             # The flat teacher rows are grouped solely by n_docs_per_sample;
             # verify that every query's gold index is valid before constructing
             # labels so a changed collator cannot silently misalign chunks.
@@ -809,10 +873,6 @@ class LongContextEmbeddingModel(SentenceTransformer):
                     teacher_queries, teacher_chunks, teacher_padding, kwargs["queries_chunk_indices"]
                 )
 
-        doc_inputs = args[0]["docs_inputs"]
-        chunk_offsets = args[0].get("chunk_offsets")
-        if chunk_offsets is None:
-            raise ValueError("ModernBERT contextual training requires explicit chunk_offsets")
         if self.training and self.self_distillation:
             offset_counts = [len(row) for row in chunk_offsets]
             if offset_counts != list(chunk_counts):

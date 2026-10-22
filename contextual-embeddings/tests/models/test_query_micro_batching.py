@@ -33,8 +33,9 @@ class DummyBaseModel(nn.Module):
 
     def forward(self, features):
         self.forward_shapes.append(tuple(features["input_ids"].shape))
-        embeddings = features["input_ids"].float().sum(dim=1, keepdim=True) * self.scale
-        return {"sentence_embedding": embeddings}
+        token_embeddings = features["input_ids"].float().unsqueeze(-1) * self.scale
+        embeddings = token_embeddings.sum(dim=1)
+        return {"sentence_embedding": embeddings, "token_embeddings": token_embeddings}
 
 
 def test_query_micro_batching_preserves_order_and_gradients():
@@ -102,3 +103,24 @@ def test_offset_tokenization_preserves_chunk_layout_and_pooling():
     assert token_chunks.shape == (2, 3, 2, 2)
     assert token_padding.tolist() == [[False, False, False], [False, True, True]]
     assert torch.equal(token_chunks[0, 0], hidden[0, 3:5])
+
+
+def test_full_document_teacher_pools_chunks_from_frozen_encoder():
+    model = LongContextEmbeddingModel(
+        DummyBaseModel(),
+        normalize_embeddings=False,
+        self_distillation=True,
+        self_distillation_teacher_full_document=True,
+    )
+    documents, offsets = model._offset_tokenize_documents([["first", "second"]])
+    queries = {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones((1, 2), dtype=torch.long)}
+
+    teacher_queries, teacher_chunks, padding = model._encode_full_document_teacher_embeddings(
+        queries, documents, offsets
+    )
+
+    assert teacher_queries.shape == (1, 1)
+    assert teacher_chunks.shape == (1, 2, 1)
+    assert padding.tolist() == [[False, False]]
+    assert torch.equal(teacher_chunks[0, :, 0], torch.tensor([3.5, 3.5]))
+    assert all(not parameter.requires_grad for parameter in model.teacher_base_model.parameters())

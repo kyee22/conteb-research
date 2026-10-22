@@ -19,6 +19,8 @@ config:
     self_distillation: True
     self_distillation_rank_k: 1
     self_distillation_alpha: 0.5
+    # When enabled, the frozen teacher encodes each complete document before chunk pooling.
+    self_distillation_teacher_full_document: True
     query_micro_batch_size: 32
     document_micro_batch_size: 16
   multi_ctx_training: !cfg multi_ctx_training # passed to both model and trainer
