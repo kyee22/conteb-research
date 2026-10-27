@@ -1,0 +1,12 @@
+{
+  "completed_datasets": [
+    "esg-reports",
+    "geography",
+    "covid-qa",
+    "insurance",
+    "football",
+    "squad-conteb-eval",
+    "narrative-qa",
+    "mldr-conteb-eval"
+  ]
+}

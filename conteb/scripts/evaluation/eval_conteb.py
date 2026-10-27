@@ -48,7 +48,7 @@ from cde_benchmark.evaluators.nanobeir import NanoBEIR
 from cde_benchmark.formatters.data_formatter import DataFormatter
 
 DATASETS = [
-    "esg-reports",
+    # "esg-reports",
     "geography",
     "covid-qa",   
     "insurance",

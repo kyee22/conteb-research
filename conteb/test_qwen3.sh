@@ -200,7 +200,7 @@
 #     qwen3_late \
 #     qwen3-embedding-0.6b-late-chunking-self-distill-seq0.5_alpha0.5_rank1
 
-uv run python scripts/evaluation/eval_conteb.py \
-    /root/kyx/conteb-research/conteb/checkpoints/qwen3-embedding-4b/qwen3-embedding-4b-late-chunking-self-distill-seq0.5_alpha0.5_rank1 \
-    qwen3_late \
-    qwen3-embedding-4b-late-chunking-self-distill-seq0.5_alpha0.5_rank1
+# uv run python scripts/evaluation/eval_conteb.py \
+#     /root/kyx/conteb-research/conteb/checkpoints/qwen3-embedding-0.6b/qwen3-embedding-0.6b-late-chunking-self-distill-seq0.5_alpha0.5_rank1 \
+#     qwen3_late \
+#     qwen3-embedding-0.6b-late-chunking-self-distill-seq0.5_alpha0.5_rank1
